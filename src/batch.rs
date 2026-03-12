@@ -95,6 +95,10 @@ impl Batch {
 		)
 	}
 
+	pub fn delete_at(&mut self, key: impl AsRef<[u8]>, timestamp: u64) -> Result<()> {
+		self.add_record(InternalKeyKind::Delete, key.as_ref().to_vec(), None, timestamp)
+	}
+
 	/// Returns the number of entries in the batch.
 	pub fn len(&self) -> usize {
 		self.entries.len()
@@ -206,18 +210,6 @@ impl Batch {
 	#[cfg(test)]
 	pub(crate) fn entries(&self) -> &[BatchEntry] {
 		&self.entries
-	}
-
-	/// Test helper to add a set operation with explicit timestamp (for backward compatibility)
-	#[cfg(test)]
-	pub(crate) fn set_with_ts(&mut self, key: Key, value: Value, timestamp: u64) -> Result<()> {
-		self.add_record(InternalKeyKind::Set, key, Some(value), timestamp)
-	}
-
-	/// Test helper to add a delete operation with explicit timestamp
-	#[cfg(test)]
-	pub(crate) fn delete_with_ts(&mut self, key: Key, timestamp: u64) -> Result<()> {
-		self.add_record(InternalKeyKind::Delete, key, None, timestamp)
 	}
 
 	/// Set the starting sequence number for this batch

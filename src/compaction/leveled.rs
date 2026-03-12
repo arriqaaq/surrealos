@@ -5,6 +5,7 @@ use std::sync::Arc;
 use super::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::levels::{Level, LevelManifest};
 use crate::sstable::table::Table;
+use crate::sstable::SstId;
 use crate::{InternalKeyRange, Options, Result};
 
 /// Compaction priority strategy for selecting files to compact
@@ -53,6 +54,15 @@ impl Strategy {
 			max_bytes_for_level: opts.max_bytes_for_level,
 			level_multiplier: opts.level_multiplier,
 			compaction_priority: CompactionPriority::default(),
+		}
+	}
+
+	/// Create a Strategy that only compacts from a specific source level.
+	/// Used by the beat/bar scheduler to target individual levels per half-bar.
+	pub(crate) fn with_target_level(opts: Arc<Options>, source_level: u8) -> TargetedStrategy {
+		TargetedStrategy {
+			source_level,
+			inner: Self::from_options(opts),
 		}
 	}
 
@@ -141,14 +151,14 @@ impl Strategy {
 	/// **Result:** {1, 2, 3} - File 4 excluded due to clean gap between "d" and "e"
 	pub(crate) fn select_overlapping_ranges(
 		level: &Level,
-		initial_table_id: u64,
-	) -> Result<Vec<u64>> {
+		initial_table_id: SstId,
+	) -> Result<Vec<SstId>> {
 		// Verify the initial table exists in the level
 		if !level.tables.iter().any(|t| t.id == initial_table_id) {
 			return Err(crate::error::Error::TableNotFound(initial_table_id));
 		}
 
-		let mut selected_ids: HashSet<u64> = HashSet::new();
+		let mut selected_ids: HashSet<SstId> = HashSet::new();
 		selected_ids.insert(initial_table_id);
 
 		// Keep expanding until no new files are added (fixed point)
@@ -186,9 +196,9 @@ impl Strategy {
 		source_level: &Level,
 		next_level: &Level,
 		source_level_num: u8,
-	) -> Result<Vec<u64>> {
+	) -> Result<Vec<SstId>> {
 		let mut tables = vec![];
-		let mut table_id_set = HashSet::new();
+		let mut table_id_set: HashSet<SstId> = HashSet::new();
 
 		if source_level.tables.is_empty() {
 			return Ok(tables);
@@ -242,7 +252,7 @@ impl Strategy {
 		Ok(tables)
 	}
 
-	fn select_best_table_for_compaction(&self, source_level: &Level) -> Option<u64> {
+	fn select_best_table_for_compaction(&self, source_level: &Level) -> Option<SstId> {
 		if source_level.tables.is_empty() {
 			return None;
 		}
@@ -259,14 +269,14 @@ impl Strategy {
 	}
 
 	/// Selects ranges that haven't been compacted for longest
-	fn select_oldest_smallest_seq_first(&self, source_level: &Level) -> Option<u64> {
+	fn select_oldest_smallest_seq_first(&self, source_level: &Level) -> Option<SstId> {
 		if source_level.tables.is_empty() {
 			return None;
 		}
 
 		#[derive(Debug)]
 		struct Choice {
-			table_id: u64,
+			table_id: SstId,
 			smallest_seq: u64,
 			file_size: u64,
 		}
@@ -295,14 +305,14 @@ impl Strategy {
 	}
 
 	/// Selects files whose latest update is oldest (cold data)
-	fn select_oldest_largest_seq_first(&self, source_level: &Level) -> Option<u64> {
+	fn select_oldest_largest_seq_first(&self, source_level: &Level) -> Option<SstId> {
 		if source_level.tables.is_empty() {
 			return None;
 		}
 
 		#[derive(Debug)]
 		struct Choice {
-			table_id: u64,
+			table_id: SstId,
 			largest_seq: u64,
 			file_size: u64,
 		}
@@ -331,14 +341,14 @@ impl Strategy {
 	}
 
 	/// Selects files based on compensated size
-	pub(crate) fn select_by_compensated_size(&self, source_level: &Level) -> Option<u64> {
+	pub(crate) fn select_by_compensated_size(&self, source_level: &Level) -> Option<SstId> {
 		if source_level.tables.is_empty() {
 			return None;
 		}
 
 		#[derive(Debug)]
 		struct Choice {
-			table_id: u64,
+			table_id: SstId,
 			compensated_size: f64,
 		}
 
@@ -444,6 +454,81 @@ impl CompactionStrategy for Strategy {
 
 		if tables_to_merge.is_empty() {
 			return Ok(CompactionChoice::Skip);
+		}
+
+		Ok(CompactionChoice::Merge(CompactionInput {
+			tables_to_merge,
+			source_level,
+			target_level,
+		}))
+	}
+}
+
+/// A strategy that only compacts from a specific source level.
+/// Used by the beat/bar scheduler to target individual levels per half-bar
+pub(crate) struct TargetedStrategy {
+	source_level: u8,
+	inner: Strategy,
+}
+
+impl CompactionStrategy for TargetedStrategy {
+	fn pick_levels(&self, manifest: &LevelManifest) -> Result<CompactionChoice> {
+		let levels = manifest.levels.get_levels();
+		let source_level = self.source_level;
+
+		if source_level as usize >= levels.len() {
+			return Ok(CompactionChoice::Skip);
+		}
+
+		// Check if this level needs compaction
+		let needs_compaction = if source_level == 0 {
+			// L0: trigger based on file count
+			levels[0].tables.len() >= self.inner.level0_file_num_trigger
+		} else {
+			// L1+: trigger based on size ratio
+			let bytes = Strategy::level_bytes(&levels[source_level as usize]);
+			let target = self.inner.target_bytes_for_level(source_level);
+			target > 0 && bytes as f64 / target as f64 >= 1.0
+		};
+
+		if !needs_compaction {
+			return Ok(CompactionChoice::Skip);
+		}
+
+		// Allow same-level compaction at the bottom level for tombstone cleanup
+		let target_level = if source_level >= manifest.last_level_index() {
+			source_level
+		} else {
+			source_level + 1
+		};
+
+		let tables_to_merge = self.inner.select_tables_for_compaction(
+			&levels[source_level as usize],
+			&levels[target_level as usize],
+			source_level,
+		)?;
+
+		if tables_to_merge.is_empty() {
+			return Ok(CompactionChoice::Skip);
+		}
+
+		// Check for move-table optimization.
+		// For L1+ with a single selected source table, if all tables_to_merge are from the
+		// source level only (no target-level overlap), we can just move the table metadata.
+		if source_level > 0 && source_level != target_level {
+			let best_table =
+				self.inner.select_best_table_for_compaction(&levels[source_level as usize]);
+			if let Some(table_id) = best_table {
+				// If the only table in tables_to_merge is the source table itself,
+				// it means there's no overlap in the target level
+				if tables_to_merge.len() == 1 && tables_to_merge[0] == table_id {
+					return Ok(CompactionChoice::Move(CompactionInput {
+						tables_to_merge: vec![table_id],
+						source_level,
+						target_level,
+					}));
+				}
+			}
 		}
 
 		Ok(CompactionChoice::Merge(CompactionInput {

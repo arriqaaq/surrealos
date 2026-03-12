@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 
-/// Defines the logical clock that SurrealKV will use to measure
+/// Defines the logical clock that SurrealOS will use to measure
 /// commit timestamps and retention periods checks.
 pub trait LogicalClock: Debug + Send + Sync {
 	/// Returns a timestamp (typically measured in nanoseconds since the unix

@@ -3,11 +3,12 @@ use bytes::{Buf, BufMut, BytesMut};
 use crate::error::Error;
 use crate::sstable::error::SSTableError;
 use crate::sstable::table::TableFormat;
+use crate::sstable::SstId;
 use crate::{CompressionType, InternalKey, Result};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Properties {
-	pub(crate) id: u64,
+	pub(crate) id: SstId,
 	pub(crate) table_format: TableFormat,
 	pub(crate) num_entries: u64,
 	pub(crate) num_deletions: u64,
@@ -30,7 +31,6 @@ pub(crate) struct Properties {
 	pub(crate) item_count: u64,
 	pub(crate) key_count: u64,
 	pub(crate) tombstone_count: u64,
-	pub(crate) num_soft_deletes: u64,
 
 	// Range deletion metrics
 	pub(crate) num_range_deletions: u64,
@@ -48,7 +48,7 @@ pub(crate) struct Properties {
 impl Properties {
 	pub(crate) fn new() -> Self {
 		Properties {
-			id: 0,
+			id: SstId::nil(),
 			table_format: TableFormat::LSMV1,
 			num_entries: 0,
 			num_deletions: 0,
@@ -64,7 +64,6 @@ impl Properties {
 			item_count: 0,
 			key_count: 0,
 			tombstone_count: 0,
-			num_soft_deletes: 0,
 			num_range_deletions: 0,
 			block_size: 0,
 			block_count: 0,
@@ -77,7 +76,7 @@ impl Properties {
 
 	pub(crate) fn encode(&self) -> Vec<u8> {
 		let mut buf = BytesMut::with_capacity(256);
-		buf.put_u64(self.id);
+		buf.put_u128(self.id.0);
 		buf.put_u8(self.table_format as u8);
 		buf.put_u64(self.num_entries);
 		buf.put_u64(self.num_deletions);
@@ -93,7 +92,6 @@ impl Properties {
 		buf.put_u64(self.item_count);
 		buf.put_u64(self.key_count);
 		buf.put_u64(self.tombstone_count);
-		buf.put_u64(self.num_soft_deletes);
 		buf.put_u64(self.num_range_deletions);
 		buf.put_u32(self.block_size);
 		buf.put_u32(self.block_count);
@@ -107,7 +105,7 @@ impl Properties {
 
 	pub(crate) fn decode(buf: Vec<u8>) -> Result<Self> {
 		let mut buf = &buf[..];
-		let id = buf.get_u64();
+		let id = SstId::from(buf.get_u128());
 		let table_format = buf.get_u8();
 		let num_entries = buf.get_u64();
 		let num_deletions = buf.get_u64();
@@ -123,7 +121,6 @@ impl Properties {
 		let item_count = buf.get_u64();
 		let key_count = buf.get_u64();
 		let tombstone_count = buf.get_u64();
-		let num_soft_deletes = buf.get_u64();
 		let num_range_deletions = buf.get_u64();
 		let block_size = buf.get_u32();
 		let block_count = buf.get_u32();
@@ -150,7 +147,6 @@ impl Properties {
 			item_count,
 			key_count,
 			tombstone_count,
-			num_soft_deletes,
 			num_range_deletions,
 			block_size,
 			block_count,

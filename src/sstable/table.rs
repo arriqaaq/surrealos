@@ -73,9 +73,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crc32fast::Hasher as Crc32;
-use integer_encoding::{FixedInt, FixedIntWriter};
+use integer_encoding::FixedIntWriter;
 use snap::raw::max_compress_len;
 
+use crate::cloud_store::CloudStore;
 use crate::compression::CompressionSelector;
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
@@ -83,11 +84,10 @@ use crate::sstable::error::SSTableError;
 use crate::sstable::filter_block::{FilterBlockReader, FilterBlockWriter};
 use crate::sstable::index_block::{Index, IndexIterator, IndexWriter};
 use crate::sstable::meta::TableMetadata;
-use crate::vfs::File;
+use crate::sstable::SstId;
 use crate::{
 	Comparator,
 	CompressionType,
-	FilterPolicy,
 	InternalKey,
 	InternalKeyKind,
 	InternalKeyRange,
@@ -104,10 +104,10 @@ use crate::{
 // =============================================================================
 
 /// Footer is 42 bytes: format(2) + meta_handle(16) + index_handle(16) + magic(8)
-const TABLE_FOOTER_LENGTH: usize = 42;
+pub(crate) const TABLE_FOOTER_LENGTH: usize = 42;
 
 /// Full footer includes checksum: 42 + 8 = 50 bytes
-const TABLE_FULL_FOOTER_LENGTH: usize = TABLE_FOOTER_LENGTH + 8;
+pub(crate) const TABLE_FULL_FOOTER_LENGTH: usize = TABLE_FOOTER_LENGTH + 8;
 
 /// Magic number to identify valid SSTable files (arbitrary but unique)
 const TABLE_MAGIC_FOOTER_ENCODED: [u8; 8] = [0x57, 0xfb, 0x80, 0x8b, 0x24, 0x75, 0x47, 0xdb];
@@ -208,22 +208,6 @@ impl Footer {
 		}
 	}
 
-	/// Reads the footer bytes from the end of the file.
-	pub(crate) fn read_from(reader: Arc<dyn File>, file_size: usize) -> Result<Vec<u8>> {
-		if file_size < TABLE_FULL_FOOTER_LENGTH {
-			return Err(Error::from(SSTableError::FileTooSmall {
-				file_size,
-				min_size: TABLE_FULL_FOOTER_LENGTH,
-			}));
-		}
-
-		let mut buf = vec![0; TABLE_FULL_FOOTER_LENGTH];
-		let offset = file_size - TABLE_FULL_FOOTER_LENGTH;
-		reader.read_at(offset as u64, &mut buf)?;
-
-		Ok(buf)
-	}
-
 	/// Decodes a footer from raw bytes.
 	pub(crate) fn decode(buf: &[u8]) -> Result<Footer> {
 		// Step 1: Validate magic number (last 8 bytes)
@@ -265,6 +249,13 @@ impl Footer {
 			meta_index,
 			index: index_handle,
 		})
+	}
+
+	/// Encodes the footer into a new Vec.
+	pub(crate) fn encode_to_vec(&self) -> Vec<u8> {
+		let mut buf = vec![0u8; TABLE_FULL_FOOTER_LENGTH];
+		self.encode(&mut buf);
+		buf
 	}
 
 	/// Encodes the footer into a byte buffer.
@@ -352,7 +343,7 @@ pub(crate) struct TableWriter<W: Write> {
 }
 
 impl<W: Write> TableWriter<W> {
-	pub(crate) fn new(writer: W, id: u64, opts: Arc<Options>, target_level: u8) -> Self {
+	pub(crate) fn new(writer: W, id: SstId, opts: Arc<Options>, target_level: u8) -> Self {
 		let fb = {
 			if let Some(policy) = opts.filter_policy.clone() {
 				let mut f = FilterBlockWriter::new(Arc::clone(&policy));
@@ -624,9 +615,6 @@ impl<W: Write> TableWriter<W> {
 		if key.is_tombstone() {
 			props.num_deletions += 1;
 			props.tombstone_count += 1;
-			if key.kind() == InternalKeyKind::SoftDelete {
-				props.num_soft_deletes += 1;
-			}
 		}
 		props.key_count += 1;
 		props.data_size += (key.encode().len() + value.len()) as u64;
@@ -697,37 +685,12 @@ pub(crate) fn decompress_block(
 	}
 }
 
-/// Reads and decodes the footer from a file.
-fn read_footer(f: Arc<dyn File>, file_size: usize) -> Result<Footer> {
-	let buf = Footer::read_from(f, file_size)?;
-	Footer::decode(&buf)
-}
-
-/// Reads raw bytes at a block handle's location.
-fn read_bytes(f: Arc<dyn File>, location: &BlockHandle) -> Result<Vec<u8>> {
-	let mut buf = vec![0; location.size()];
-	f.read_at(location.offset() as u64, &mut buf).map(|_| buf)
-}
-
 /// Calculates CRC32 checksum for a block.
 pub(crate) fn calculate_checksum(block: &[u8], compression_type: CompressionType) -> Crc32 {
 	let mut cksum = Crc32::new();
 	cksum.update(block);
 	cksum.update(&[compression_type as u8; BLOCK_COMPRESS_LEN]);
 	cksum
-}
-
-/// Reads a filter block from the file.
-pub(crate) fn read_filter_block(
-	src: Arc<dyn File>,
-	location: &BlockHandle,
-	policy: Arc<dyn FilterPolicy>,
-) -> Result<FilterBlockReader> {
-	if location.size() == 0 {
-		return Err(Error::FilterBlockEmpty);
-	}
-	let buf = read_bytes(src, location)?;
-	Ok(FilterBlockReader::new(buf, policy))
 }
 
 fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> {
@@ -742,51 +705,6 @@ fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> 
 		return Ok(Some(TableMetadata::decode(buf_bytes)?));
 	}
 	Ok(None)
-}
-
-/// Reads and verifies a table block from the file.
-pub(crate) fn read_table_block(
-	comparator: Arc<dyn Comparator>,
-	f: Arc<dyn File>,
-	location: &BlockHandle,
-) -> Result<Block> {
-	// Read block data
-	let buf = read_bytes(Arc::clone(&f), location)?;
-
-	// Read compression type (1 byte after block data)
-	let compress = read_bytes(
-		Arc::clone(&f),
-		&BlockHandle::new(location.offset() + location.size(), BLOCK_COMPRESS_LEN),
-	)?;
-
-	// Read checksum (4 bytes after compression type)
-	let cksum = read_bytes(
-		Arc::clone(&f),
-		&BlockHandle::new(
-			location.offset() + location.size() + BLOCK_COMPRESS_LEN,
-			BLOCK_CKSUM_LEN,
-		),
-	)?;
-
-	// Verify checksum
-	if !verify_table_block(&buf, compress[0], unmask(u32::decode_fixed(&cksum).unwrap())) {
-		return Err(Error::from(SSTableError::ChecksumVerificationFailed {
-			block_offset: location.offset() as u64,
-		}));
-	}
-
-	// Decompress
-	let block = decompress_block(&buf, CompressionType::try_from(compress[0])?)?;
-
-	Ok(Block::new(block, comparator))
-}
-
-/// Verifies a block's checksum.
-fn verify_table_block(block: &[u8], compression_type: u8, want: u32) -> bool {
-	let mut cksum = Crc32::new();
-	cksum.update(block);
-	cksum.update(&[compression_type; BLOCK_COMPRESS_LEN]);
-	cksum.finalize() == want
 }
 
 // =============================================================================
@@ -822,12 +740,11 @@ pub enum IndexType {
 /// Uses TableIterator which coordinates:
 /// - first_level: IndexIterator (navigates index entries)
 /// - second_level: BlockIterator (navigates data block entries)
-#[derive(Clone)]
 pub(crate) struct Table {
-	pub id: u64,
-	pub file: Arc<dyn File>,
-	#[allow(unused)]
+	pub id: SstId,
+	pub(crate) table_store: Arc<CloudStore>,
 	pub file_size: u64,
+	pub(crate) footer: Footer,
 
 	pub(crate) opts: Arc<Options>,
 	pub(crate) meta: TableMetadata,
@@ -836,30 +753,46 @@ pub(crate) struct Table {
 	pub(crate) filter_reader: Option<FilterBlockReader>,
 }
 
+impl Clone for Table {
+	fn clone(&self) -> Self {
+		Self {
+			id: self.id,
+			table_store: Arc::clone(&self.table_store),
+			file_size: self.file_size,
+			footer: self.footer.clone(),
+			opts: Arc::clone(&self.opts),
+			meta: self.meta.clone(),
+			index_block: self.index_block.clone(),
+			filter_reader: self.filter_reader.clone(),
+		}
+	}
+}
+
 impl Table {
 	/// Opens an SSTable file for reading.
-	pub(crate) fn new(
-		id: u64,
+	pub(crate) async fn new(
+		id: SstId,
 		opts: Arc<Options>,
-		file: Arc<dyn File>,
+		table_store: Arc<CloudStore>,
 		file_size: u64,
 	) -> Result<Table> {
 		// Step 1: Read footer
-		let footer = read_footer(Arc::clone(&file), file_size as usize)?;
+		let footer = table_store.read_footer(&id, file_size).await?;
 
-		// Step 2: Load partitioned index
+		// Step 2: Load top-level index block and build partitioned index
+		let top_level_block = table_store
+			.read_table_block(&id, &footer.index, Arc::clone(&opts.internal_comparator))
+			.await?;
 		let index_block = {
 			let partitioned_index =
-				Index::new(id, Arc::clone(&opts), Arc::clone(&file), &footer.index)?;
+				Index::new(id, Arc::clone(&opts), Arc::clone(&table_store), top_level_block)?;
 			IndexType::Partitioned(partitioned_index)
 		};
 
 		// Step 3: Load meta index block
-		let metaindexblock = read_table_block(
-			Arc::clone(&opts.internal_comparator),
-			Arc::clone(&file),
-			&footer.meta_index,
-		)?;
+		let metaindexblock = table_store
+			.read_table_block(&id, &footer.meta_index, Arc::clone(&opts.internal_comparator))
+			.await?;
 
 		// Step 4: Extract metadata
 		let writer_metadata =
@@ -867,15 +800,16 @@ impl Table {
 
 		// Step 5: Load filter block if configured
 		let filter_reader = if opts.filter_policy.is_some() {
-			Self::read_filter_block(&metaindexblock, Arc::clone(&file), &opts)?
+			Self::read_filter_block_async(&metaindexblock, &table_store, id, &opts).await?
 		} else {
 			None
 		};
 
 		Ok(Table {
 			id,
-			file,
+			table_store,
 			file_size,
+			footer,
 			opts,
 			filter_reader,
 			index_block,
@@ -883,9 +817,58 @@ impl Table {
 		})
 	}
 
-	fn read_filter_block(
+	/// Opens an SSTable using pre-loaded metadata from the manifest.
+	/// Only reads the index block and filter block from object store (2 reads
+	/// instead of 4).
+	pub(crate) async fn open(
+		id: SstId,
+		opts: Arc<Options>,
+		table_store: Arc<CloudStore>,
+		file_size: u64,
+		footer: Footer,
+		meta: TableMetadata,
+	) -> Result<Table> {
+		// Load top-level index block
+		let top_level_block = table_store
+			.read_table_block(&id, &footer.index, Arc::clone(&opts.internal_comparator))
+			.await?;
+		let index_block = {
+			let partitioned_index =
+				Index::new(id, Arc::clone(&opts), Arc::clone(&table_store), top_level_block)?;
+			IndexType::Partitioned(partitioned_index)
+		};
+
+		// Load meta index block (needed for filter)
+		let filter_reader = if opts.filter_policy.is_some() {
+			let metaindexblock = table_store
+				.read_table_block(&id, &footer.meta_index, Arc::clone(&opts.internal_comparator))
+				.await?;
+			Self::read_filter_block_async(&metaindexblock, &table_store, id, &opts).await?
+		} else {
+			None
+		};
+
+		Ok(Table {
+			id,
+			table_store,
+			file_size,
+			footer,
+			opts,
+			filter_reader,
+			index_block,
+			meta,
+		})
+	}
+
+	/// Returns a reference to the footer.
+	pub(crate) fn footer(&self) -> &Footer {
+		&self.footer
+	}
+
+	async fn read_filter_block_async(
 		metaix: &Block,
-		file: Arc<dyn File>,
+		table_store: &Arc<CloudStore>,
+		table_id: SstId,
 		options: &Options,
 	) -> Result<Option<FilterBlockReader>> {
 		let filter_name = format!("filter.{}", options.filter_policy.as_ref().unwrap().name());
@@ -911,30 +894,27 @@ impl Table {
 				Ok(res) => res.0,
 			};
 			if filter_block_location.size() > 0 {
-				return Ok(Some(read_filter_block(
-					file,
-					&filter_block_location,
-					Arc::clone(options.filter_policy.as_ref().unwrap()),
-				)?));
+				let buf = table_store.read_block_bytes(&table_id, &filter_block_location).await?;
+				let policy = Arc::clone(options.filter_policy.as_ref().unwrap());
+				return Ok(Some(FilterBlockReader::new(buf.to_vec(), policy)));
 			}
 		}
 		Ok(None)
 	}
 
 	/// Reads a data block, using cache if available.
-	pub(crate) fn read_block(&self, location: &BlockHandle) -> Result<Arc<Block>> {
+	pub(crate) async fn read_block(&self, location: &BlockHandle) -> Result<Arc<Block>> {
 		// Check cache first
 		if let Some(block) = self.opts.block_cache.get_data_block(self.id, location.offset() as u64)
 		{
 			return Ok(block);
 		}
 
-		// Cache miss: read from disk
-		let b = read_table_block(
-			Arc::clone(&self.opts.internal_comparator),
-			Arc::clone(&self.file),
-			location,
-		)?;
+		// Cache miss: read from object store
+		let b = self
+			.table_store
+			.read_table_block(&self.id, location, Arc::clone(&self.opts.internal_comparator))
+			.await?;
 		let b = Arc::new(b);
 
 		// Insert into cache
@@ -947,7 +927,7 @@ impl Table {
 	///
 	/// History blocks are cached separately from normal data blocks since they
 	/// use different comparators for iteration.
-	pub(crate) fn read_block_with_comparator(
+	pub(crate) async fn read_block_with_comparator(
 		&self,
 		location: &BlockHandle,
 		comparator: Arc<dyn Comparator>,
@@ -959,8 +939,8 @@ impl Table {
 			return Ok(block);
 		}
 
-		// Cache miss: read from disk
-		let b = read_table_block(comparator, Arc::clone(&self.file), location)?;
+		// Cache miss: read from object store
+		let b = self.table_store.read_table_block(&self.id, location, comparator).await?;
 		let b = Arc::new(b);
 
 		// Insert into history cache
@@ -996,7 +976,7 @@ impl Table {
 	///   → Seek for "banana"
 	///   → If found and user_key matches → return value
 	/// ```
-	pub(crate) fn get(&self, key: &InternalKey) -> Result<Option<(InternalKey, Value)>> {
+	pub(crate) async fn get(&self, key: &InternalKey) -> Result<Option<(InternalKey, Value)>> {
 		let key_encoded = key.encode();
 
 		// Step 1: Bloom filter for early rejection
@@ -1016,7 +996,7 @@ impl Table {
 		};
 
 		// Step 3: Load partition block and seek
-		let partition_block = partitioned_index.load_block(partition_handle)?;
+		let partition_block = partitioned_index.load_block(partition_handle).await?;
 		let mut partition_iter = partition_block.iter()?;
 		partition_iter.seek_internal(&key_encoded)?;
 
@@ -1033,7 +1013,7 @@ impl Table {
 		})?;
 
 		// Step 4: Read data block and search
-		let data_block = self.read_block(&data_handle)?;
+		let data_block = self.read_block(&data_handle).await?;
 		let mut iter = data_block.iter()?;
 		iter.seek_internal(&key_encoded)?;
 
@@ -1310,7 +1290,7 @@ impl<'a> TableIterator<'a> {
 	/// 1. Get block handle from current first_level entry
 	/// 2. Read the data block (with caching)
 	/// 3. Create a BlockIterator for it
-	fn init_data_block(&mut self) -> Result<()> {
+	async fn init_data_block(&mut self) -> Result<()> {
 		if !self.first_level.valid() {
 			self.second_level = None;
 			return Ok(());
@@ -1320,10 +1300,11 @@ impl<'a> TableIterator<'a> {
 
 		// Load data block - use custom comparator if set, otherwise use cached version
 		let iter = if let Some(ref comparator) = self.custom_comparator {
-			let block = self.table.read_block_with_comparator(&handle, Arc::clone(comparator))?;
+			let block =
+				self.table.read_block_with_comparator(&handle, Arc::clone(comparator)).await?;
 			block.iter()?
 		} else {
-			let block = self.table.read_block(&handle)?;
+			let block = self.table.read_block(&handle).await?;
 			block.iter()?
 		};
 		self.second_level = Some(iter);
@@ -1372,7 +1353,7 @@ impl<'a> TableIterator<'a> {
 	///
 	/// Result: iterator now at "date" (correct answer for seek("banana"))
 	/// ```
-	fn advance_to_valid_entry(&mut self) -> Result<()> {
+	async fn advance_to_valid_entry(&mut self) -> Result<()> {
 		loop {
 			// Success: current position is valid
 			if self.second_level.as_ref().is_some_and(|iter| iter.is_valid()) {
@@ -1385,8 +1366,8 @@ impl<'a> TableIterator<'a> {
 				return Ok(());
 			}
 
-			self.first_level.next()?;
-			self.init_data_block()?;
+			self.first_level.next().await?;
+			self.init_data_block().await?;
 
 			// Position at first entry of new block
 			if let Some(ref mut iter) = self.second_level {
@@ -1398,7 +1379,7 @@ impl<'a> TableIterator<'a> {
 	/// Retreats to the previous valid entry when current position is invalid.
 	///
 	/// Mirror of advance_to_valid_entry for backward iteration.
-	fn retreat_to_valid_entry(&mut self) -> Result<()> {
+	async fn retreat_to_valid_entry(&mut self) -> Result<()> {
 		loop {
 			if self.second_level.as_ref().is_some_and(|iter| iter.is_valid()) {
 				return Ok(());
@@ -1409,8 +1390,8 @@ impl<'a> TableIterator<'a> {
 				return Ok(());
 			}
 
-			self.first_level.prev()?;
-			self.init_data_block()?;
+			self.first_level.prev().await?;
+			self.init_data_block().await?;
 
 			if let Some(ref mut iter) = self.second_level {
 				iter.seek_to_last()?;
@@ -1526,7 +1507,7 @@ impl<'a> TableIterator<'a> {
 	/// ```
 	///
 	/// Edge case: If ("apple", 0) actually exists, we land on it and advance.
-	pub(crate) fn seek_to_first(&mut self) -> Result<()> {
+	pub(crate) async fn seek_to_first(&mut self) -> Result<()> {
 		self.exhausted = false;
 
 		let lower_bound = self.range.0.clone();
@@ -1534,17 +1515,17 @@ impl<'a> TableIterator<'a> {
 		match lower_bound {
 			Bound::Unbounded => {
 				// No lower bound: seek to absolute first
-				self.first_level.seek_to_first()?;
-				self.init_data_block()?;
+				self.first_level.seek_to_first().await?;
+				self.init_data_block().await?;
 				if let Some(ref mut iter) = self.second_level {
 					iter.seek_to_first()?;
 				}
-				self.advance_to_valid_entry()?;
+				self.advance_to_valid_entry().await?;
 			}
 			Bound::Included(ref internal_key) => {
 				// internal_key has seq_num=MAX_SEQ (smallest for this user_key)
 				// Seeking to it finds the first version of this user_key
-				self.seek_internal(&internal_key.encode())?;
+				self.seek_internal(&internal_key.encode()).await?;
 			}
 			Bound::Excluded(ref internal_key) => {
 				// Create seek key with seq_num=0 (LARGEST for this user_key)
@@ -1555,11 +1536,11 @@ impl<'a> TableIterator<'a> {
 					InternalKeyKind::Set,
 					0,
 				);
-				self.seek_internal(&seek_key.encode())?;
+				self.seek_internal(&seek_key.encode()).await?;
 
 				// Edge case: if we somehow landed on exactly (user_key, 0), advance past it
 				if self.is_valid() && self.current_user_key() == internal_key.user_key.as_slice() {
-					self.advance_internal()?;
+					self.advance_internal().await?;
 				}
 			}
 		}
@@ -1619,7 +1600,7 @@ impl<'a> TableIterator<'a> {
 	/// Check: "banana" < "banana"? No (Equal, not Less) → prev()
 	/// Result: ("apple", 3) - last entry with user_key < "banana" ✓
 	/// ```
-	pub(crate) fn seek_to_last(&mut self) -> Result<()> {
+	pub(crate) async fn seek_to_last(&mut self) -> Result<()> {
 		self.exhausted = false;
 
 		let upper_bound = self.range.1.clone();
@@ -1627,12 +1608,12 @@ impl<'a> TableIterator<'a> {
 		match upper_bound {
 			Bound::Unbounded => {
 				// No upper bound: seek to absolute last
-				self.first_level.seek_to_last()?;
-				self.init_data_block()?;
+				self.first_level.seek_to_last().await?;
+				self.init_data_block().await?;
 				if let Some(ref mut iter) = self.second_level {
 					iter.seek_to_last()?;
 				}
-				self.retreat_to_valid_entry()?;
+				self.retreat_to_valid_entry().await?;
 			}
 			Bound::Included(ref internal_key) => {
 				// Seek to (user_key, 0) = LARGEST internal key for this user_key
@@ -1640,11 +1621,11 @@ impl<'a> TableIterator<'a> {
 				let bound_user_key = internal_key.user_key.clone();
 				let seek_key =
 					InternalKey::new(internal_key.user_key.clone(), 0, InternalKeyKind::Set, 0);
-				self.seek_internal(&seek_key.encode())?;
+				self.seek_internal(&seek_key.encode()).await?;
 
 				if !self.is_valid() {
 					// Seek went past end of table, position at absolute last
-					self.position_to_absolute_last()?;
+					self.position_to_absolute_last().await?;
 				} else {
 					// Check if we landed past the bound (on a later user_key)
 					let cmp = self
@@ -1654,7 +1635,7 @@ impl<'a> TableIterator<'a> {
 						.compare(self.current_user_key(), bound_user_key.as_slice());
 					if cmp == Ordering::Greater {
 						// We're past the bound, back up one entry
-						self.prev_internal()?;
+						self.prev_internal().await?;
 					}
 					// If cmp is Equal or Less, we're already on a valid position
 					// (this can happen if (user_key, 0) exists or we landed on earlier key)
@@ -1670,11 +1651,11 @@ impl<'a> TableIterator<'a> {
 					InternalKeyKind::Max,
 					INTERNAL_KEY_TIMESTAMP_MAX,
 				);
-				self.seek_internal(&seek_key.encode())?;
+				self.seek_internal(&seek_key.encode()).await?;
 
 				if !self.is_valid() {
 					// Seek went past end, position at absolute last
-					self.position_to_absolute_last()?;
+					self.position_to_absolute_last().await?;
 				}
 
 				// For Excluded: back up if we're AT or PAST the bound
@@ -1687,7 +1668,7 @@ impl<'a> TableIterator<'a> {
 						.compare(self.current_user_key(), bound_user_key.as_slice());
 					if cmp != Ordering::Less {
 						// We're on the excluded key or past it, back up
-						self.prev_internal()?;
+						self.prev_internal().await?;
 					}
 				}
 			}
@@ -1720,12 +1701,12 @@ impl<'a> TableIterator<'a> {
 	///   4. advance_to_valid_entry()
 	///      → If step 3 went past all entries, advance to next block
 	/// ```
-	fn seek_internal(&mut self, target: &[u8]) -> Result<()> {
+	async fn seek_internal(&mut self, target: &[u8]) -> Result<()> {
 		// Step 1: Position first_level at the right index entry
-		self.first_level.seek(target)?;
+		self.first_level.seek(target).await?;
 
 		// Step 2: Load the data block it points to
-		self.init_data_block()?;
+		self.init_data_block().await?;
 
 		// Step 3: Seek within the data block
 		if let Some(ref mut iter) = self.second_level {
@@ -1734,47 +1715,48 @@ impl<'a> TableIterator<'a> {
 
 		// Step 4: Handle case where seek went past all entries
 		// This is NECESSARY because separator keys are upper bounds!
-		self.advance_to_valid_entry()?;
+		self.advance_to_valid_entry().await?;
 		Ok(())
 	}
 
-	fn position_to_absolute_last(&mut self) -> Result<()> {
-		self.first_level.seek_to_last()?;
-		self.init_data_block()?;
+	async fn position_to_absolute_last(&mut self) -> Result<()> {
+		self.first_level.seek_to_last().await?;
+		self.init_data_block().await?;
 
 		if let Some(ref mut iter) = self.second_level {
 			iter.seek_to_last()?;
 		}
 
-		self.retreat_to_valid_entry()?;
+		self.retreat_to_valid_entry().await?;
 		Ok(())
 	}
 
-	fn advance_internal(&mut self) -> Result<bool> {
+	async fn advance_internal(&mut self) -> Result<bool> {
 		if let Some(ref mut iter) = self.second_level {
 			if iter.advance()? {
 				return Ok(true);
 			}
 		}
-		self.advance_to_valid_entry()?;
+		self.advance_to_valid_entry().await?;
 		Ok(self.is_valid())
 	}
 
-	fn prev_internal(&mut self) -> Result<bool> {
+	async fn prev_internal(&mut self) -> Result<bool> {
 		if let Some(ref mut iter) = self.second_level {
 			if iter.prev_internal()? {
 				return Ok(true);
 			}
 		}
-		self.retreat_to_valid_entry()?;
+		self.retreat_to_valid_entry().await?;
 		Ok(self.is_valid())
 	}
 }
 
+#[async_trait::async_trait]
 impl LSMIterator for TableIterator<'_> {
-	fn seek(&mut self, target: &[u8]) -> Result<bool> {
+	async fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.exhausted = false;
-		self.seek_internal(target)?;
+		self.seek_internal(target).await?;
 
 		if self.is_valid() && !self.satisfies_upper_bound(self.current_user_key()) {
 			self.mark_exhausted();
@@ -1782,27 +1764,27 @@ impl LSMIterator for TableIterator<'_> {
 		Ok(self.is_valid())
 	}
 
-	fn seek_first(&mut self) -> Result<bool> {
-		self.seek_to_first()?;
+	async fn seek_first(&mut self) -> Result<bool> {
+		self.seek_to_first().await?;
 		Ok(self.is_valid())
 	}
 
-	fn seek_last(&mut self) -> Result<bool> {
-		self.seek_to_last()?;
+	async fn seek_last(&mut self) -> Result<bool> {
+		self.seek_to_last().await?;
 		Ok(self.is_valid())
 	}
 
-	fn next(&mut self) -> Result<bool> {
+	async fn next(&mut self) -> Result<bool> {
 		// Auto-position on first call
 		if !self.is_valid() && !self.exhausted {
-			return self.seek_first();
+			return self.seek_first().await;
 		}
 
 		if !self.is_valid() {
 			return Ok(false);
 		}
 
-		self.advance_internal()?;
+		self.advance_internal().await?;
 
 		if !self.is_valid() || !self.satisfies_upper_bound(self.current_user_key()) {
 			self.mark_exhausted();
@@ -1810,17 +1792,17 @@ impl LSMIterator for TableIterator<'_> {
 		Ok(self.is_valid())
 	}
 
-	fn prev(&mut self) -> Result<bool> {
+	async fn prev(&mut self) -> Result<bool> {
 		// Auto-position on first call
 		if !self.is_valid() && !self.exhausted {
-			return self.seek_last();
+			return self.seek_last().await;
 		}
 
 		if !self.is_valid() {
 			return Ok(false);
 		}
 
-		self.prev_internal()?;
+		self.prev_internal().await?;
 
 		if !self.is_valid() || !self.satisfies_lower_bound(self.current_user_key()) {
 			self.mark_exhausted();
@@ -1840,5 +1822,69 @@ impl LSMIterator for TableIterator<'_> {
 	fn value_encoded(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
 		Ok(self.second_level.as_ref().unwrap().value_bytes())
+	}
+}
+
+/// An owned table iterator that holds `Arc<Table>` internally,
+/// allowing it to be stored across beat boundaries without lifetime constraints.
+///
+/// This uses the standard self-referential pattern: the `iter` field borrows from
+/// the `Table` inside `_table`. Field drop order (declaration order) ensures `iter`
+/// is dropped before `_table`.
+pub(crate) struct OwnedTableIter {
+	// SAFETY: `iter` borrows from the Table inside `_table`.
+	// Declared first → dropped first, before the Arc<Table>.
+	iter: TableIterator<'static>,
+	// Arc<Table> keeps the Table data alive for the iterator's lifetime.
+	_table: Arc<Table>,
+}
+
+impl OwnedTableIter {
+	pub(crate) fn new(table: Arc<Table>, range: Option<InternalKeyRange>) -> Result<Self> {
+		let range = range.unwrap_or((std::ops::Bound::Unbounded, std::ops::Bound::Unbounded));
+		let iter = table.iter(Some(range))?;
+		// SAFETY: We own the Arc<Table> in this struct and it will outlive the iterator
+		// because `iter` (declared first) is dropped before `_table` (declared second).
+		// The Arc guarantees the Table data stays alive until the last Arc is dropped.
+		let iter: TableIterator<'static> = unsafe { std::mem::transmute(iter) };
+		Ok(Self {
+			iter,
+			_table: table,
+		})
+	}
+}
+
+#[async_trait::async_trait]
+impl LSMIterator for OwnedTableIter {
+	async fn seek(&mut self, target: &[u8]) -> Result<bool> {
+		self.iter.seek(target).await
+	}
+
+	async fn seek_first(&mut self) -> Result<bool> {
+		self.iter.seek_first().await
+	}
+
+	async fn seek_last(&mut self) -> Result<bool> {
+		self.iter.seek_last().await
+	}
+
+	async fn next(&mut self) -> Result<bool> {
+		self.iter.next().await
+	}
+
+	async fn prev(&mut self) -> Result<bool> {
+		self.iter.prev().await
+	}
+
+	fn valid(&self) -> bool {
+		self.iter.valid()
+	}
+
+	fn key(&self) -> InternalKeyRef<'_> {
+		self.iter.key()
+	}
+
+	fn value_encoded(&self) -> Result<&[u8]> {
+		self.iter.value_encoded()
 	}
 }

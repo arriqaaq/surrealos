@@ -62,4 +62,4 @@ fuzz/
 /fuzz/artifacts/
 /fuzz/corpus/
 /fuzz/target/
-
+/specs

@@ -140,7 +140,7 @@ impl InternalKeyComparator {
 
 impl Comparator for InternalKeyComparator {
 	fn name(&self) -> &'static str {
-		"surrealkv.InternalKeyComparator"
+		"surrealos.InternalKeyComparator"
 	}
 
 	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
@@ -240,7 +240,7 @@ impl TimestampComparator {
 
 impl Comparator for TimestampComparator {
 	fn name(&self) -> &'static str {
-		"surrealkv.TimestampComparator"
+		"surrealos.TimestampComparator"
 	}
 
 	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {

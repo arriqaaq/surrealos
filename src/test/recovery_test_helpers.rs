@@ -9,7 +9,7 @@ use crate::batch::Batch;
 use crate::memtable::MemTable;
 use crate::wal::manager::Wal;
 use crate::wal::Options;
-use crate::{LSMIterator, Tree};
+use crate::{LSMIterator, Store};
 
 pub struct RecoveryTestHelper;
 
@@ -19,7 +19,7 @@ impl RecoveryTestHelper {
 	/// Returns the total number of keys written
 	#[allow(unused)]
 	pub async fn fill_multiple_wal_segments(
-		tree: &Tree,
+		store: &Store,
 		wal_count: usize,
 		keys_per_wal: usize,
 	) -> usize {
@@ -30,16 +30,14 @@ impl RecoveryTestHelper {
 				let key = format!("key_{:05}", total_keys);
 				let value = format!("value_wal{}_key{}", wal_idx, key_idx);
 
-				let mut txn = tree.begin().unwrap();
-				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-				txn.commit().await.unwrap();
+				store.set(key.as_bytes(), value.as_bytes()).await.unwrap();
 
 				total_keys += 1;
 			}
 
 			// Trigger flush to rotate to next WAL (except for last iteration)
 			if wal_idx < wal_count - 1 {
-				tree.flush().unwrap();
+				store.flush().await.unwrap();
 			}
 		}
 
@@ -93,17 +91,16 @@ impl RecoveryTestHelper {
 	}
 
 	/// Verify a key exists with expected value
-	pub async fn verify_key(tree: &Tree, key: &str, expected_value: &str) {
-		let txn = tree.begin().unwrap();
-		let result = txn.get(key.as_bytes()).unwrap();
+	pub async fn verify_key(store: &Store, key: &str, expected_value: &str) {
+		let result = store.get(key.as_bytes()).await.unwrap();
 		assert!(result.is_some(), "Key '{}' should exist but was not found", key);
 		assert_eq!(result.unwrap(), expected_value.as_bytes(), "Key '{}' has wrong value", key);
 	}
 
 	/// Get manifest log number (using internal access for testing)
-	pub fn get_manifest_log_number(tree: &Tree) -> u64 {
+	pub fn get_manifest_log_number(store: &Store) -> u64 {
 		// Access through the deref'd inner Core fields
-		tree.core.level_manifest.read().unwrap().get_log_number()
+		store.core.level_manifest.read().unwrap().get_log_number()
 	}
 }
 
@@ -139,11 +136,11 @@ impl WalTestHelper {
 
 		for (seg_idx, &entry_count) in entries_per_segment.iter().enumerate() {
 			if entry_count > 0 {
-				let mut batch = Batch::new(current_seq);
+				let mut batch = Batch::new_with_seq(current_seq);
 				for i in 0..entry_count {
 					let key = format!("seg{}_key{:04}", seg_idx, i);
 					let value = format!("seg{}_value{:04}", seg_idx, i);
-					batch.set(key.as_bytes().to_vec(), value.as_bytes().to_vec(), 0).unwrap();
+					batch.set(&key, &value).unwrap();
 					current_seq += 1;
 				}
 				wal.append(&batch.encode().unwrap()).unwrap();
@@ -179,11 +176,11 @@ impl WalTestHelper {
 
 			// Now create the batch for this segment
 			let entry_count = (seq_end - seq_start + 1) as usize;
-			let mut batch = Batch::new(seq_start);
+			let mut batch = Batch::new_with_seq(seq_start);
 			for i in 0..entry_count {
 				let key = format!("key{}", seq_start + i as u64);
 				let value = format!("value{}", seq_start + i as u64);
-				batch.set(key.as_bytes().to_vec(), value.as_bytes().to_vec(), 0).unwrap();
+				batch.set(&key, &value).unwrap();
 			}
 			wal.append(&batch.encode().unwrap()).unwrap();
 			wal.close().unwrap();
@@ -193,11 +190,11 @@ impl WalTestHelper {
 			let mut wal = Wal::open(dir, opts).unwrap();
 
 			let entry_count = (seq_end - seq_start + 1) as usize;
-			let mut batch = Batch::new(seq_start);
+			let mut batch = Batch::new_with_seq(seq_start);
 			for i in 0..entry_count {
 				let key = format!("key{}", seq_start + i as u64);
 				let value = format!("value{}", seq_start + i as u64);
-				batch.set(key.as_bytes().to_vec(), value.as_bytes().to_vec(), 0).unwrap();
+				batch.set(&key, &value).unwrap();
 			}
 			wal.append(&batch.encode().unwrap()).unwrap();
 			wal.close().unwrap();
@@ -259,22 +256,22 @@ impl WalTestHelper {
 	}
 
 	/// Count total entries across all memtables
-	pub fn count_total_entries(memtables: &[(Arc<MemTable>, u64)]) -> usize {
+	pub async fn count_total_entries(memtables: &[(Arc<MemTable>, u64)]) -> usize {
 		let mut total_entries = 0;
 		for (memtable, _) in memtables {
 			let mut iter = memtable.iter();
-			iter.seek_first().unwrap();
+			iter.seek_first().await.unwrap();
 			while iter.valid() {
 				total_entries += 1;
-				iter.next().unwrap();
+				iter.next().await.unwrap();
 			}
 		}
 		total_entries
 	}
 
 	/// Verify total entry count across all memtables
-	pub fn verify_total_entry_count(memtables: &[(Arc<MemTable>, u64)], expected: usize) {
-		let actual = Self::count_total_entries(memtables);
+	pub async fn verify_total_entry_count(memtables: &[(Arc<MemTable>, u64)], expected: usize) {
+		let actual = Self::count_total_entries(memtables).await;
 		assert_eq!(
 			actual, expected,
 			"Total entry count mismatch. Found: {}, Expected: {}",
@@ -283,18 +280,18 @@ impl WalTestHelper {
 	}
 
 	/// Verify that all memtables together contain expected keys
-	pub fn verify_entries_across_memtables(
+	pub async fn verify_entries_across_memtables(
 		memtables: &[(Arc<MemTable>, u64)],
 		expected_keys: &[String],
 	) {
 		let mut found_keys = Vec::new();
 		for (memtable, _) in memtables {
 			let mut iter = memtable.iter();
-			iter.seek_first().unwrap();
+			iter.seek_first().await.unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned().user_key.clone();
 				found_keys.push(String::from_utf8(key.clone()).unwrap());
-				iter.next().unwrap();
+				iter.next().await.unwrap();
 			}
 		}
 		found_keys.sort();

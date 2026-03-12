@@ -7,42 +7,28 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::batch::Batch;
-use crate::checkpoint::{CheckpointMetadata, DatabaseCheckpoint};
+use crate::cloud_store::CloudStore;
 use crate::commit::{CommitEnv, CommitPipeline};
-use crate::compaction::compactor::{CompactionOptions, Compactor};
+use crate::compaction::CompactionScheduler;
+#[cfg(test)]
 use crate::compaction::CompactionStrategy;
+use crate::epoch::EpochManifest;
 use crate::error::{BackgroundErrorHandler, BackgroundErrorReason, Result};
-use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
+use crate::levels::LevelManifest;
 use crate::lockfile::LockFile;
+use crate::manifest::{
+	serialize_manifest,
+	write_manifest_to_disk,
+	ManifestChangeSet,
+	ManifestUploader,
+};
 use crate::memtable::{ImmutableEntry, ImmutableMemtables, MemTable};
+use crate::paths::StorePaths;
 use crate::snapshot::{Snapshot, SnapshotTracker};
 use crate::sstable::table::Table;
-use crate::stall::{StallCounts, StallThresholds, WriteStallCountProvider};
-use crate::task::TaskManager;
 use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
 use crate::wal::{self, cleanup_old_segments, Wal, WalManager};
-use crate::{Comparator, Error, FilterPolicy, LSMIterator, Options, Value, WalRecoveryMode};
-
-// ===== Compaction Operations Trait =====
-/// Defines the compaction operations that can be performed on an LSM tree.
-/// Compaction is essential for maintaining read performance by merging
-/// overlapping SSTables and removing deleted entries.
-pub trait CompactionOperations: Send + Sync {
-	/// Flushes the active memtable to disk, converting it into an immutable
-	/// SSTable. This is the first step in the LSM tree's write path.
-	fn compact_memtable(&self) -> Result<()>;
-
-	/// Performs compaction according to the specified strategy.
-	/// Compaction merges SSTables to reduce read amplification and remove
-	/// tombstones.
-	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()>;
-
-	/// Returns a reference to the background error handler
-	fn error_handler(&self) -> Arc<BackgroundErrorHandler>;
-
-	/// Returns true if there are immutable memtables pending flush.
-	fn has_pending_immutables(&self) -> bool;
-}
+use crate::{Comparator, Error, FilterPolicy, Options, Value, WalRecoveryMode};
 
 // ===== Core LSM Tree Implementation =====
 /// The core of an LSM (Log-Structured Merge) tree implementation.
@@ -119,11 +105,24 @@ pub(crate) struct CoreInner {
 	/// Visible sequence number - the highest sequence number that is visible to readers.
 	/// Shared with CommitPipeline for coordinated updates.
 	pub(crate) visible_seq_num: Arc<AtomicU64>,
+
+	/// Compaction scheduler driven from the commit path
+	/// Protected by tokio::Mutex since compact_beat() is async and needs &mut self.
+	pub(crate) compaction_scheduler: tokio::sync::Mutex<CompactionScheduler>,
+
+	/// Central abstraction for SST reads/writes via object store.
+	pub(crate) table_store: Arc<CloudStore>,
+
+	/// Manifest uploader for async object store uploads.
+	pub(crate) manifest_uploader: Arc<ManifestUploader>,
+
+	/// Fencing state for writer/compactor epoch tracking.
+	pub(crate) fencing: EpochManifest,
 }
 
 impl CoreInner {
 	/// Creates a new LSM tree core instance
-	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
+	pub(crate) async fn new(opts: Arc<Options>) -> Result<Self> {
 		// Acquire database lock to prevent multiple processes from opening the same
 		// database
 		let mut lockfile = LockFile::new(&opts.path);
@@ -133,8 +132,89 @@ impl CoreInner {
 		let immutable_memtables = Arc::new(RwLock::new(ImmutableMemtables::default()));
 
 		// Initialize level manifest FIRST to get log_number
-		let manifest = LevelManifest::new(Arc::clone(&opts))?;
+		let local_sst_dir = if opts.local_sst_cache && !opts.path.as_os_str().is_empty() {
+			let dir = opts.sstable_dir();
+			std::fs::create_dir_all(&dir)?;
+			Some(dir)
+		} else {
+			None
+		};
+		let table_store = Arc::new(CloudStore::new(
+			Arc::clone(&opts.object_store),
+			StorePaths::new_with_branch(opts.object_store_root.as_str(), opts.branch_name.clone()),
+			local_sst_dir,
+		));
+
+		let mut manifest = LevelManifest::new(Arc::clone(&opts), Arc::clone(&table_store)).await?;
 		let manifest_log_number = manifest.get_log_number();
+
+		// Clean up local orphaned SST files from crashes or leader transitions
+		if opts.local_sst_cache && !opts.path.as_os_str().is_empty() {
+			crate::gc::cleanup_local_orphans(&opts.sstable_dir(), &manifest);
+		}
+
+		// Recover incomplete branch creations.
+		// Scans the registry for "Creating" branches and either completes
+		// or cleans up the interrupted creation.
+		if opts.branch_name.is_some() {
+			use crate::branch::BranchStatus;
+
+			let root_path: object_store::path::Path = opts.object_store_root.as_str().into();
+			let mut registry =
+				crate::branch::load_registry(opts.object_store.as_ref(), &root_path).await?;
+			let mut changed = false;
+
+			let branches_snapshot: Vec<_> = registry
+				.branches()
+				.iter()
+				.filter(|(_, info)| info.status == BranchStatus::Creating)
+				.map(|(name, info)| (name.clone(), info.clone()))
+				.collect();
+
+			for (name, info) in branches_snapshot {
+				let branch_resolver =
+					StorePaths::new_with_branch(root_path.clone(), Some(name.clone()));
+				let branch_store =
+					CloudStore::new(Arc::clone(&opts.object_store), branch_resolver, None);
+
+				if branch_store.read_latest_manifest().await?.is_some() {
+					// Manifest exists — creation completed, just status update missed
+					registry.update_status(&name, BranchStatus::Active)?;
+					changed = true;
+					log::info!("Branch '{}': completed status update (was Creating)", name);
+				} else {
+					// Manifest missing — re-create from parent
+					let parent_resolver =
+						StorePaths::new_with_branch(root_path.clone(), info.parent_branch.clone());
+					let parent_store =
+						CloudStore::new(Arc::clone(&opts.object_store), parent_resolver, None);
+					if let Ok(bytes) = parent_store.read_manifest(info.source_manifest_id).await {
+						let reset_bytes = crate::manifest::reset_manifest_for_branch(&bytes)?;
+						branch_store.write_manifest(1, bytes::Bytes::from(reset_bytes)).await?;
+						registry.update_status(&name, BranchStatus::Active)?;
+						changed = true;
+						log::info!(
+							"Branch '{}': recovered from Creating (re-wrote manifest)",
+							name
+						);
+					} else {
+						// Parent manifest gone — remove the incomplete branch
+						registry.remove(&name);
+						changed = true;
+						log::warn!(
+							"Branch '{}': removed (parent manifest {} unavailable)",
+							name,
+							info.source_manifest_id
+						);
+					}
+				}
+			}
+
+			if changed {
+				crate::branch::save_registry(opts.object_store.as_ref(), &root_path, &registry)
+					.await?;
+			}
+		}
 
 		// Initialize WAL starting from manifest.log_number
 		let wal_path = opts.wal_dir();
@@ -151,30 +231,122 @@ impl CoreInner {
 		initial_memtable.set_wal_number(wal_instance.get_active_log_number());
 		let active_memtable = Arc::new(RwLock::new(initial_memtable));
 
+		// Initialize writer and compactor fencing if leader_id is set (distributed mode)
+		let fencing = if opts.leader_id > 0 {
+			let mut f = EpochManifest::init_writer(
+				&mut manifest,
+				opts.leader_id,
+				&table_store,
+				&opts,
+				opts.manifest_update_timeout,
+			)
+			.await?;
+			f.claim_compactor_epoch(
+				&mut manifest,
+				&table_store,
+				&opts,
+				opts.manifest_update_timeout,
+			)
+			.await?;
+			f
+		} else {
+			EpochManifest::new_unfenced()
+		};
+
 		let level_manifest = Arc::new(RwLock::new(manifest));
+
+		let error_handler = Arc::new(BackgroundErrorHandler::new());
+		let snapshot_tracker = SnapshotTracker::new();
+
+		// Create manifest uploader watch channel and background task.
+		// Watch channel guarantees the latest manifest is always retained (never dropped).
+		// Each manifest is a complete snapshot — skipping intermediate versions is correct.
+		let (manifest_tx, mut manifest_rx) =
+			tokio::sync::watch::channel::<Option<(u64, bytes::Bytes)>>(None);
+		let manifest_uploader = Arc::new(ManifestUploader::new(manifest_tx));
+		{
+			let ts = Arc::clone(&table_store);
+			tokio::spawn(async move {
+				loop {
+					if manifest_rx.changed().await.is_err() {
+						break; // Sender dropped, shutdown
+					}
+					let entry = manifest_rx.borrow_and_update().clone();
+					if let Some((manifest_id, data)) = entry {
+						match ts.write_manifest_if_absent(manifest_id, data).await {
+							Ok(()) => {}
+							Err(crate::Error::ManifestVersionExists) => {
+								log::info!(
+									"Manifest {} already exists in object store (expected during fencing transitions)",
+									manifest_id
+								);
+							}
+							Err(e) => {
+								log::warn!(
+									"Failed to upload manifest {} to object store: {e}",
+									manifest_id
+								);
+							}
+						}
+					}
+				}
+			});
+		}
+
+		// Spawn background SST purger when branching is enabled.
+		// Periodically scans all branch manifests and deletes orphaned SSTs
+		// from the shared object store pool.
+		if opts.branch_name.is_some() {
+			let purger_os = Arc::clone(&opts.object_store);
+			let purger_root = opts.object_store_root.clone();
+			tokio::spawn(async move {
+				let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
+				loop {
+					interval.tick().await;
+					let root_path: object_store::path::Path = purger_root.as_str().into();
+					match crate::branch::load_registry(purger_os.as_ref(), &root_path).await {
+						Ok(registry) => {
+							if let Err(e) =
+								crate::gc::purge_orphaned_ssts(&purger_os, &purger_root, &registry)
+									.await
+							{
+								log::warn!("Background SST purge failed: {e}");
+							}
+						}
+						Err(e) => {
+							log::warn!("Failed to load branch registry for purge: {e}");
+						}
+					}
+				}
+			});
+		}
+
+		let compaction_scheduler = CompactionScheduler::new(
+			Arc::clone(&opts),
+			Arc::clone(&level_manifest),
+			Arc::clone(&immutable_memtables),
+			Arc::clone(&error_handler),
+			snapshot_tracker.clone(),
+			Arc::clone(&table_store),
+			Arc::clone(&manifest_uploader),
+			fencing.compactor_epoch(),
+		);
 
 		Ok(Self {
 			opts,
 			active_memtable,
 			immutable_memtables,
 			level_manifest,
-			snapshot_tracker: SnapshotTracker::new(),
+			snapshot_tracker,
 			wal: WalManager::new(wal_instance),
 			lockfile: Mutex::new(lockfile),
-			error_handler: Arc::new(BackgroundErrorHandler::new()),
+			error_handler,
 			visible_seq_num,
+			compaction_scheduler: tokio::sync::Mutex::new(compaction_scheduler),
+			table_store,
+			manifest_uploader,
+			fencing,
 		})
-	}
-
-	pub(crate) fn immutable_count(&self) -> usize {
-		self.immutable_memtables.read().map(|imm| imm.iter().count()).unwrap_or(0)
-	}
-
-	pub(crate) fn l0_file_count(&self) -> usize {
-		self.level_manifest
-			.read()
-			.map(|m| m.levels.get_levels().first().map(|l| l.tables.len()).unwrap_or(0))
-			.unwrap_or(0)
 	}
 
 	/// Flushes a memtable to SST and atomically updates the manifest.
@@ -192,15 +364,21 @@ impl CoreInner {
 	///
 	/// # Returns
 	/// The flushed SSTable
-	fn flush_immutable_to_sst(
+	async fn flush_immutable_to_sst(
 		&self,
 		memtable: Arc<MemTable>,
-		table_id: u64,
+		table_id: crate::sstable::SstId,
 		wal_number: u64,
 	) -> Result<Arc<Table>> {
-		let table = memtable.flush(table_id, Arc::clone(&self.opts)).map_err(|e| {
-			Error::Other(format!("Failed to flush memtable to SST table_id={}: {}", table_id, e))
-		})?;
+		let table = memtable
+			.flush(table_id, Arc::clone(&self.opts), Arc::clone(&self.table_store))
+			.await
+			.map_err(|e| {
+				Error::Other(format!(
+					"Failed to flush memtable to SST table_id={}: {}",
+					table_id, e
+				))
+			})?;
 
 		log::debug!("Created SST table_id={}, file_size={}", table.id, table.file_size);
 
@@ -221,17 +399,25 @@ impl CoreInner {
 		let mut manifest = self.level_manifest.write()?;
 		let mut memtable_lock = self.immutable_memtables.write()?;
 
+		// Check if we've been fenced before writing
+		self.fencing.check_writer_fenced(&manifest)?;
+
 		let rollback = manifest.apply_changeset(&changeset)?;
-		if let Err(e) = write_manifest_to_disk(&manifest) {
-			manifest.revert_changeset(rollback);
-			let error = Error::Other(format!(
-				"Failed to atomically update manifest: table_id={}, log_number={}: {}",
-				table_id,
-				wal_number + 1,
-				e
-			));
-			self.error_handler.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
-			return Err(error);
+		match write_manifest_to_disk(&mut manifest) {
+			Ok(bytes) => {
+				self.manifest_uploader.queue_upload(manifest.manifest_id, bytes);
+			}
+			Err(e) => {
+				manifest.revert_changeset(rollback);
+				let error = Error::Other(format!(
+					"Failed to atomically update manifest: table_id={}, log_number={}: {}",
+					table_id,
+					wal_number + 1,
+					e
+				));
+				self.error_handler.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
+				return Err(error);
+			}
 		}
 
 		// Remove successfully flushed memtable from immutables tracking
@@ -299,7 +485,7 @@ impl CoreInner {
 		//   Thread A (rotate): holds imm.write, waits manifest.read
 		//   Thread B (flush):  holds manifest.write, waits imm.write
 		// By acquiring manifest.read first, we ensure no circular wait.
-		let table_id = self.level_manifest.read()?.next_table_id();
+		let table_id = crate::levels::next_sst_id();
 		let mut immutable_memtables = self.immutable_memtables.write()?;
 		immutable_memtables.add(table_id, flushed_wal_number, Arc::clone(&flushed_memtable));
 
@@ -323,7 +509,7 @@ impl CoreInner {
 	/// 1. Gets the oldest entry from immutable queue (lowest table_id)
 	/// 2. Flushes it to SST via flush_immutable_to_sst (which also removes from queue)
 	/// 3. Schedules async WAL cleanup
-	fn flush_oldest_immutable_to_sst(&self) -> Result<Option<Arc<Table>>> {
+	async fn flush_oldest_immutable_to_sst(&self) -> Result<Option<Arc<Table>>> {
 		// Get the oldest immutable entry (clone to release lock before I/O)
 		let entry = {
 			let guard = self.immutable_memtables.read()?;
@@ -356,11 +542,9 @@ impl CoreInner {
 		);
 
 		// Flush to SST (this also removes from immutable queue and updates manifest)
-		let table = self.flush_immutable_to_sst(
-			Arc::clone(&entry.memtable),
-			entry.table_id,
-			entry.wal_number,
-		)?;
+		let table = self
+			.flush_immutable_to_sst(Arc::clone(&entry.memtable), entry.table_id, entry.wal_number)
+			.await?;
 
 		// Schedule async WAL cleanup
 		let wal_dir = self.wal.read().get_dir_path().to_path_buf();
@@ -392,11 +576,11 @@ impl CoreInner {
 	}
 
 	/// Flushes ALL immutable memtables synchronously.
-	/// Used by Tree::flush() and checkpoint for forced/sync flush.
+	/// Used by Tree::flush() for forced/sync flush.
 	/// Blocks until all immutables are written to SST.
-	pub(crate) fn flush_all_immutables_sync(&self) -> Result<()> {
+	pub(crate) async fn flush_all_immutables_sync(&self) -> Result<()> {
 		let mut count = 0;
-		while self.flush_oldest_immutable_to_sst()?.is_some() {
+		while self.flush_oldest_immutable_to_sst().await?.is_some() {
 			count += 1;
 		}
 		if count > 0 {
@@ -430,65 +614,53 @@ impl CoreInner {
 	/// 3. SST is added to Level 0
 	/// 4. Manifest log_number is updated to mark flushed WALs
 	/// 5. This marks all previous WALs as flushed
-	fn flush_memtable_and_update_manifest(
+	async fn flush_memtable_and_update_manifest(
 		&self,
 		flushed_wal_number: Option<u64>,
 	) -> Result<Option<Arc<Table>>> {
 		// Step 1: Atomically swap active memtable with a new empty one
-		let mut active_memtable = self.active_memtable.write()?;
+		// Scope the lock guards so they are dropped before the async flush
+		let (flushed_memtable, table_id, wal_that_was_flushed) = {
+			let mut active_memtable = self.active_memtable.write()?;
 
-		// Don't flush an empty memtable
-		if active_memtable.is_empty() {
-			return Ok(None);
-		}
-
-		// LOCK ORDER: Get table_id from manifest BEFORE acquiring immutable_memtables lock.
-		// This maintains consistent ordering: active -> level_manifest -> immutable_memtables
-		// which matches flush_immutable_to_sst() and prevents deadlock with background flush.
-		let table_id = self.level_manifest.read()?.next_table_id();
-
-		let mut immutable_memtables = self.immutable_memtables.write()?;
-
-		// Get the current WAL number for the new memtable
-		let current_wal_number = self.wal.read().get_active_log_number();
-
-		// Swap the active memtable with a new empty one
-		// This allows writes to continue immediately
-		let flushed_memtable = std::mem::replace(
-			&mut *active_memtable,
-			Arc::new(MemTable::new(self.opts.max_memtable_size)),
-		);
-
-		// Set the WAL number on the new active memtable
-		active_memtable.set_wal_number(current_wal_number);
-
-		// Get the WAL number from the memtable (set when it started receiving writes)
-		// or use the current WAL if not set
-		let memtable_wal_number = flushed_memtable.get_wal_number();
-
-		// Track the immutable memtable until it's successfully flushed
-		immutable_memtables.add(table_id, memtable_wal_number, Arc::clone(&flushed_memtable));
-
-		// Release locks before the potentially slow flush operation
-		drop(active_memtable);
-		drop(immutable_memtables);
-
-		// Step 2: Determine which WAL was flushed
-		let wal_that_was_flushed = match flushed_wal_number {
-			Some(num) => num,
-			None => {
-				// No explicit WAL provided, use the memtable's stored WAL number
-				// This is the WAL that was active when the memtable started receiving writes
-				memtable_wal_number
+			// Don't flush an empty memtable
+			if active_memtable.is_empty() {
+				return Ok(None);
 			}
-		};
+
+			// Generate table_id BEFORE acquiring immutable_memtables lock.
+			let table_id = crate::levels::next_sst_id();
+
+			let mut immutable_memtables = self.immutable_memtables.write()?;
+
+			// Get the current WAL number for the new memtable
+			let current_wal_number = self.wal.read().get_active_log_number();
+
+			// Swap the active memtable with a new empty one
+			let flushed_memtable = std::mem::replace(
+				&mut *active_memtable,
+				Arc::new(MemTable::new(self.opts.max_memtable_size)),
+			);
+
+			// Set the WAL number on the new active memtable
+			active_memtable.set_wal_number(current_wal_number);
+
+			// Get the WAL number from the memtable
+			let memtable_wal_number = flushed_memtable.get_wal_number();
+
+			// Track the immutable memtable until it's successfully flushed
+			immutable_memtables.add(table_id, memtable_wal_number, Arc::clone(&flushed_memtable));
+
+			// Step 2: Determine which WAL was flushed
+			let wal_that_was_flushed = flushed_wal_number.unwrap_or(memtable_wal_number);
+
+			(flushed_memtable, table_id, wal_that_was_flushed)
+		}; // All lock guards dropped here
 
 		// Step 3: Flush the immutable memtable to disk and update manifest
-		let table = self.flush_immutable_to_sst(
-			Arc::clone(&flushed_memtable),
-			table_id,
-			wal_that_was_flushed,
-		)?;
+		let table = self
+			.flush_immutable_to_sst(Arc::clone(&flushed_memtable), table_id, wal_that_was_flushed)
+			.await?;
 
 		Ok(Some(table))
 	}
@@ -514,7 +686,7 @@ impl CoreInner {
 	/// This method does NOT rotate the WAL. The final log_number in manifest
 	/// is set to current_wal + 1, indicating all data up to current WAL is
 	/// persisted.
-	fn flush_all_memtables_for_shutdown(&self) -> Result<()> {
+	async fn flush_all_memtables_for_shutdown(&self) -> Result<()> {
 		log::info!("Flushing all memtables for shutdown...");
 
 		// STEP 1: Flush ALL immutable memtables FIRST (older data, lower table_ids)
@@ -553,7 +725,8 @@ impl CoreInner {
 				Arc::clone(&entry.memtable),
 				entry.table_id,
 				entry.wal_number,
-			)?;
+			)
+			.await?;
 
 			flushed_count += 1;
 			log::debug!(
@@ -570,10 +743,10 @@ impl CoreInner {
 		}
 
 		// STEP 2: Flush active memtable LAST (newest data, gets highest table_id)
-		let active_memtable = self.active_memtable.read()?;
-		let active_size = active_memtable.size();
-		let active_is_empty = active_memtable.is_empty();
-		drop(active_memtable);
+		let (active_size, active_is_empty) = {
+			let active_memtable = self.active_memtable.read()?;
+			(active_memtable.size(), active_memtable.is_empty())
+		};
 
 		if !active_is_empty {
 			log::info!("Flushing active memtable last (newest data): size={}", active_size);
@@ -583,7 +756,7 @@ impl CoreInner {
 			// - Updates log_number to mark WAL as flushed
 			// - Does NOT rotate WAL (we pass None)
 			// Fail-fast: return immediately on error
-			match self.flush_memtable_and_update_manifest(None)? {
+			match self.flush_memtable_and_update_manifest(None).await? {
 				Some(table) => {
 					log::info!(
 						"Active memtable flushed: table_id={}, file_size={}",
@@ -608,16 +781,22 @@ impl CoreInner {
 				};
 
 				let mut manifest = self.level_manifest.write()?;
+				self.fencing.check_writer_fenced(&manifest)?;
 				let rollback = manifest.apply_changeset(&changeset)?;
-				if let Err(e) = write_manifest_to_disk(&manifest) {
-					manifest.revert_changeset(rollback);
-					let error = Error::Other(format!(
-						"Failed to update manifest log_number after immutable flush: {}",
-						e
-					));
-					self.error_handler
-						.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
-					return Err(error);
+				match write_manifest_to_disk(&mut manifest) {
+					Ok(bytes) => {
+						self.manifest_uploader.queue_upload(manifest.manifest_id, bytes);
+					}
+					Err(e) => {
+						manifest.revert_changeset(rollback);
+						let error = Error::Other(format!(
+							"Failed to update manifest log_number after immutable flush: {}",
+							e
+						));
+						self.error_handler
+							.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
+						return Err(error);
+					}
 				}
 
 				log::debug!(
@@ -631,132 +810,127 @@ impl CoreInner {
 		Ok(())
 	}
 
-	/// Cleans up orphaned SST files not referenced in manifest
-	/// Called during database startup to remove files from incomplete flushes
+	/// Cleans up orphaned SST files not referenced in manifest.
+	/// Called during database startup to remove files from incomplete flushes.
 	///
-	/// SAFETY: This is only safe because manifest updates are atomic.
-	/// An SST file is orphaned if and only if the atomic manifest write
-	/// (containing both SST addition and log_number update) never completed.
-	/// In that case, the WAL is still alive and will replay the data.
-	fn cleanup_orphaned_sst_files(&self) -> Result<()> {
-		let sstable_dir = self.opts.sstable_dir();
-
-		if !sstable_dir.exists() {
-			return Ok(());
-		}
+	/// Checks both local SST directory and object store for orphaned files.
+	async fn cleanup_orphaned_sst_files(&self) -> Result<()> {
+		use crate::sstable::SstId;
 
 		// Get all table IDs from manifest
-		let manifest = self.level_manifest.read()?;
-		let live_tables = manifest.get_all_tables();
-		let live_table_ids: HashSet<u64> = live_tables.keys().copied().collect();
-		drop(manifest);
+		let live_table_ids: HashSet<SstId> = {
+			let manifest = self.level_manifest.read()?;
+			manifest.get_all_tables().keys().copied().collect()
+		};
 
-		// Scan SST directory for orphaned files
-		let entries = std::fs::read_dir(&sstable_dir)?;
-		let mut removed_count = 0;
+		// Clean up local SST directory
+		let sstable_dir = self.opts.sstable_dir();
+		if sstable_dir.exists() {
+			let entries = std::fs::read_dir(&sstable_dir)?;
+			let mut local_removed = 0;
 
-		for entry in entries {
-			let entry = entry?;
-			let filename = entry.file_name();
-			let filename_str = filename.to_string_lossy();
+			for entry in entries {
+				let entry = entry?;
+				let filename = entry.file_name();
+				let filename_str = filename.to_string_lossy();
 
-			// Parse table ID from filename (format: {id:020}.sst)
-			if filename_str.ends_with(".sst") && filename_str.len() == 24 {
-				if let Ok(table_id) = filename_str[..20].parse::<u64>() {
-					// Delete if not in manifest
-					if !live_table_ids.contains(&table_id) {
-						let path = entry.path();
-						match std::fs::remove_file(&path) {
-							Ok(_) => {
-								removed_count += 1;
-								log::info!("Removed orphaned SST file: table_id={}", table_id);
-							}
-							Err(e) => {
-								log::warn!(
-									"Failed to remove orphaned SST table_id={}: {}",
-									table_id,
-									e
-								);
+				if filename_str.ends_with(".sst") {
+					let stem = filename_str.trim_end_matches(".sst");
+					if let Ok(table_id) = stem.parse::<SstId>() {
+						if !live_table_ids.contains(&table_id) {
+							let path = entry.path();
+							match std::fs::remove_file(&path) {
+								Ok(_) => {
+									local_removed += 1;
+									log::info!("Removed local orphaned SST: table_id={}", table_id);
+								}
+								Err(e) => {
+									log::warn!(
+										"Failed to remove local orphaned SST table_id={}: {}",
+										table_id,
+										e
+									);
+								}
 							}
 						}
 					}
 				}
 			}
+
+			if local_removed > 0 {
+				log::info!("Cleaned up {} local orphaned SST files", local_removed);
+			}
 		}
 
-		if removed_count > 0 {
-			log::info!("Cleaned up {} orphaned SST files", removed_count);
-		} else {
-			log::debug!("No orphaned SST files found");
+		// Clean up object store orphaned SSTs.
+		// Skip when branching is enabled — the background purger handles
+		// cross-branch GC safely. Deleting here would remove SSTs still
+		// referenced by other branches.
+		if self.opts.branch_name.is_none() {
+			match self.table_store.list_sst_ids().await {
+				Ok(remote_ids) => {
+					let mut remote_removed = 0;
+					for id in remote_ids {
+						if !live_table_ids.contains(&id) {
+							if let Err(e) = self.table_store.delete_sst(&id).await {
+								log::warn!(
+									"Failed to remove remote orphaned SST table_id={}: {}",
+									id,
+									e
+								);
+							} else {
+								remote_removed += 1;
+								log::info!("Removed remote orphaned SST: table_id={}", id);
+							}
+						}
+					}
+					if remote_removed > 0 {
+						log::info!("Cleaned up {} remote orphaned SST files", remote_removed);
+					}
+				}
+				Err(e) => {
+					log::warn!("Failed to list remote SSTs for orphan cleanup: {}", e);
+				}
+			}
 		}
 
 		Ok(())
 	}
-}
 
-impl CompactionOperations for CoreInner {
-	/// Flushes the oldest immutable memtable to SST.
-	/// Called by background task. Returns Ok(()) even if nothing to flush.
-	fn compact_memtable(&self) -> Result<()> {
-		self.flush_oldest_immutable_to_sst().map(|_| ())
-	}
-
-	/// Performs compaction to merge SSTables and maintain read performance.
-	///
-	/// Compaction is crucial for LSM tree performance:
-	/// - Merges overlapping SSTables to reduce read amplification
-	/// - Removes deleted entries to reclaim space
-	/// - Maintains the level invariants (size ratios and key ranges)
-	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()> {
-		// Create compaction options from the current LSM tree state
-		let options = CompactionOptions::from(self);
-
-		// Execute compaction according to the chosen strategy
-		let compactor = Compactor::new(options, strategy);
-		compactor.compact()?;
-
-		// // Clean deleted versions from versioned index after compaction
-		// self.clean_expired_versions()?;
-
-		Ok(())
-	}
-
-	/// Returns a reference to the background error handler
-	fn error_handler(&self) -> Arc<BackgroundErrorHandler> {
-		Arc::clone(&self.error_handler)
-	}
-
-	fn has_pending_immutables(&self) -> bool {
-		self.immutable_memtables.read().map(|guard| !guard.is_empty()).unwrap_or(false)
-	}
-}
-
-impl WriteStallCountProvider for CoreInner {
-	fn get_stall_counts(&self) -> StallCounts {
-		StallCounts {
-			immutable_memtables: self.immutable_count(),
-			l0_files: self.l0_file_count(),
-		}
+	/// Runs compaction with the given strategy (test-only convenience method).
+	/// Creates a Compactor with real shared state and runs it.
+	#[cfg(test)]
+	pub(crate) async fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()> {
+		use crate::compaction::compactor::{CompactionOptions, Compactor};
+		let compaction_opts = CompactionOptions {
+			lopts: Arc::clone(&self.opts),
+			level_manifest: Arc::clone(&self.level_manifest),
+			immutable_memtables: Arc::clone(&self.immutable_memtables),
+			error_handler: Arc::clone(&self.error_handler),
+			snapshot_tracker: self.snapshot_tracker.clone(),
+			table_store: Arc::clone(&self.table_store),
+			manifest_uploader: Arc::clone(&self.manifest_uploader),
+			local_compactor_epoch: self.fencing.compactor_epoch(),
+			branching_enabled: self.opts.branch_name.is_some(),
+		};
+		let compactor = Compactor::new(compaction_opts, strategy);
+		compactor.compact().await
 	}
 }
 
 struct LsmCommitEnv {
 	core: Arc<CoreInner>,
-
-	/// Manages background tasks like flushing and compaction
-	task_manager: Option<Arc<TaskManager>>,
 }
 
 impl LsmCommitEnv {
-	/// Creates a new commit environment for the LSM tree
-	pub(crate) fn new(core: Arc<CoreInner>, task_manager: Arc<TaskManager>) -> Result<Self> {
+	pub(crate) fn new(core: Arc<CoreInner>) -> Result<Self> {
 		Ok(Self {
 			core,
-			task_manager: Some(task_manager),
 		})
 	}
 }
 
+#[async_trait::async_trait]
 impl CommitEnv for LsmCommitEnv {
 	// Write batch to WAL (synchronous operation).
 	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch> {
@@ -784,7 +958,7 @@ impl CommitEnv for LsmCommitEnv {
 	}
 
 	/// Apply batch to memtable with retry on arena full.
-	fn apply(&self, batch: &Batch) -> Result<()> {
+	async fn apply(&self, batch: &Batch) -> Result<()> {
 		// Try to add to current memtable
 		let result = {
 			let active_memtable = self.core.active_memtable.read()?;
@@ -799,9 +973,13 @@ impl CommitEnv for LsmCommitEnv {
 
 				self.core.rotate_memtable()?;
 
-				// Schedule background flush
-				if let Some(ref task_manager) = self.task_manager {
-					task_manager.wake_up_memtable();
+				// Flush immutable memtables synchronously (commit-path compaction)
+				self.core.flush_all_immutables_sync().await?;
+
+				// Run one beat of compaction
+				{
+					let mut scheduler = self.core.compaction_scheduler.lock().await;
+					scheduler.compact_beat().await?;
 				}
 
 				// Retry on new memtable - must succeed
@@ -831,13 +1009,6 @@ pub(crate) struct Core {
 
 	/// The commit pipeline that handles write batches
 	pub(crate) commit_pipeline: Arc<CommitPipeline>,
-
-	/// Task manager for background operations (stored in Option so we can take
-	/// it for shutdown)
-	pub(crate) task_manager: Mutex<Option<Arc<TaskManager>>>,
-
-	/// Write stall controller for backpressure management
-	pub(crate) write_stall: Arc<crate::stall::WriteStallController>,
 }
 
 impl std::ops::Deref for Core {
@@ -864,7 +1035,7 @@ impl Core {
 	///
 	/// # Returns
 	/// * `(Option<max_seq_num>, Option<active_memtable>)`
-	pub(crate) fn replay_wal_with_repair<F>(
+	pub(crate) async fn replay_wal_with_repair<F, Fut>(
 		wal_path: &Path,
 		min_wal_number: u64,
 		context: &str,
@@ -873,7 +1044,8 @@ impl Core {
 		mut flush_memtable: F,
 	) -> Result<(Option<u64>, Option<Arc<MemTable>>)>
 	where
-		F: FnMut(Arc<MemTable>, u64) -> Result<()>,
+		F: FnMut(Arc<MemTable>, u64) -> Fut,
+		Fut: std::future::Future<Output = Result<()>>,
 	{
 		// Replay WAL - returns memtables per segment
 		let (wal_seq_num_opt, memtables) = match replay_wal(wal_path, min_wal_number, arena_size) {
@@ -951,67 +1123,33 @@ impl Core {
 			log::info!("Recovery: flushing {} intermediate memtables to SST", memtable_count - 1);
 			for (memtable, wal_number) in memtables.iter().take(memtable_count - 1) {
 				if !memtable.is_empty() {
-					flush_memtable(Arc::clone(memtable), *wal_number)?;
+					flush_memtable(Arc::clone(memtable), *wal_number).await?;
 				}
 			}
 		}
 
 		// Return the last memtable as the active one
 		let (last_memtable, last_wal_number) = memtables.into_iter().last().unwrap();
-		let entry_count = {
-			let mut iter = last_memtable.iter();
-			let mut count = 0;
-			if iter.seek_first().unwrap_or(false) {
-				count += 1;
-				while iter.next().unwrap_or(false) {
-					count += 1;
-				}
-			}
-			count
-		};
 		log::info!(
-			"Recovery: setting last memtable (wal={}) as active with {} entries",
+			"Recovery: setting last memtable (wal={}) as active with size={}",
 			last_wal_number,
-			entry_count
+			last_memtable.size()
 		);
 
 		Ok((wal_seq_num_opt, Some(last_memtable)))
 	}
 
 	/// Creates a new LSM tree with background task management
-	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
+	pub(crate) async fn new(opts: Arc<Options>) -> Result<Self> {
 		log::info!("=== Starting LSM tree initialization ===");
 		log::info!("Database path: {:?}", opts.path);
 
-		let inner = Arc::new(CoreInner::new(Arc::clone(&opts))?);
+		let inner = Arc::new(CoreInner::new(Arc::clone(&opts)).await?);
 
-		// Create the write stall controller with the provider and thresholds
-		let thresholds = StallThresholds {
-			memtable_limit: opts.memtable_stall_threshold,
-			l0_file_limit: opts.l0_stall_threshold,
-		};
-		let write_stall = Arc::new(crate::stall::WriteStallController::new(
-			Arc::clone(&inner) as Arc<dyn WriteStallCountProvider>,
-			thresholds,
-		));
-
-		// Initialize background task manager
-		let task_manager = Arc::new(TaskManager::new(
-			Arc::clone(&inner) as Arc<dyn CompactionOperations>,
-			Arc::clone(&opts),
-			Arc::clone(&write_stall),
-		));
-
-		let commit_env =
-			Arc::new(LsmCommitEnv::new(Arc::clone(&inner), Arc::clone(&task_manager))?);
+		let commit_env = Arc::new(LsmCommitEnv::new(Arc::clone(&inner))?);
 
 		// Pass the shared visible_seq_num from CoreInner to CommitPipeline
-		// Both will use the same atomic for coordinated updates
-		let commit_pipeline = CommitPipeline::new(
-			commit_env,
-			Arc::clone(&inner.visible_seq_num),
-			Arc::clone(&write_stall),
-		);
+		let commit_pipeline = CommitPipeline::new(commit_env, Arc::clone(&inner.visible_seq_num));
 
 		// Path for the WAL directory
 		let wal_path = opts.wal_dir();
@@ -1034,17 +1172,23 @@ impl Core {
 			opts.wal_recovery_mode,
 			opts.max_memtable_size,
 			|memtable, wal_number| {
-				// Flush intermediate memtable to SST during recovery
-				let table_id = inner.level_manifest.read()?.next_table_id();
-				inner.flush_immutable_to_sst(Arc::clone(&memtable), table_id, wal_number)?;
-				log::info!(
-					"Recovery: flushed memtable to SST table_id={}, wal_number={}",
-					table_id,
-					wal_number
-				);
-				Ok(())
+				let inner = Arc::clone(&inner);
+				async move {
+					// Flush intermediate memtable to SST during recovery
+					let table_id = crate::levels::next_sst_id();
+					inner
+						.flush_immutable_to_sst(Arc::clone(&memtable), table_id, wal_number)
+						.await?;
+					log::info!(
+						"Recovery: flushed memtable to SST table_id={}, wal_number={}",
+						table_id,
+						wal_number
+					);
+					Ok(())
+				}
 			},
-		)?;
+		)
+		.await?;
 
 		// Set recovered memtable as active (if any)
 		if let Some(memtable) = recovered_memtable {
@@ -1088,16 +1232,17 @@ impl Core {
 		// Clean up any orphaned SST files from previous crashes
 		// SAFETY: This must happen AFTER WAL replay so data is recovered
 		// but BEFORE any new flushes that might create new SSTs
-		inner.cleanup_orphaned_sst_files()?;
+		inner.cleanup_orphaned_sst_files().await?;
 
-		// Trigger level compaction check at startup
-		task_manager.wake_up_level();
+		// Run initial compaction check at startup
+		{
+			let mut scheduler = inner.compaction_scheduler.lock().await;
+			let _ = scheduler.compact_beat().await;
+		}
 
 		let core = Self {
 			inner: Arc::clone(&inner),
 			commit_pipeline: Arc::clone(&commit_pipeline),
-			task_manager: Mutex::new(Some(task_manager)),
-			write_stall,
 		};
 
 		log::info!("=== LSM tree initialization complete ===");
@@ -1147,19 +1292,7 @@ impl Core {
 		self.commit_pipeline.shutdown();
 		log::debug!("Commit pipeline shutdown complete");
 
-		// Step 2: Signal write stall controller - wake any stalled writers
-		self.write_stall.signal_shutdown();
-		log::debug!("Write stall shutdown signal sent");
-
-		// Step 3: Wait for and stop all background tasks
-		let task_manager = self.task_manager.lock().unwrap().take();
-		if let Some(task_manager) = task_manager {
-			log::debug!("Stopping background task manager...");
-			task_manager.stop().await;
-			log::debug!("Background task manager stopped");
-		}
-
-		// Step 3: Conditionally flush ALL memtables based on flush_on_close option
+		// Step 2: Conditionally flush ALL memtables based on flush_on_close option
 		// CRITICAL ORDERING: Immutable memtables must be flushed BEFORE active memtable
 		// to preserve SSTable ordering (older data = lower table_ids)
 		// IMPORTANT: We do NOT rotate the WAL here to avoid creating an empty WAL file
@@ -1167,7 +1300,7 @@ impl Core {
 			log::info!("Flushing all memtables on shutdown (flush_on_close=true)");
 
 			// Flush ALL memtables: immutables first (older data), then active (newest data)
-			self.inner.flush_all_memtables_for_shutdown().map_err(|e| {
+			self.inner.flush_all_memtables_for_shutdown().await.map_err(|e| {
 				Error::Other(format!("Failed to flush memtables during shutdown: {}", e))
 			})?;
 
@@ -1181,10 +1314,11 @@ impl Core {
 		let wal_log_number = self.inner.wal.read().get_active_log_number();
 		log::info!("Closing WAL: active_log_number={}", wal_log_number);
 
-		let mut wal_guard = self.inner.wal.write();
-		wal_guard.close().map_err(|e| Error::Other(format!("Failed to close WAL: {}", e)))?;
-		log::debug!("WAL #{:020} closed and synced", wal_log_number);
-		drop(wal_guard);
+		{
+			let mut wal_guard = self.inner.wal.write();
+			wal_guard.close().map_err(|e| Error::Other(format!("Failed to close WAL: {}", e)))?;
+			log::debug!("WAL #{:020} closed and synced", wal_log_number);
+		}
 
 		// Step 4.5: Clean up obsolete WAL files (synchronous cleanup)
 		// This happens AFTER closing the WAL to prevent deleting the active WAL file.
@@ -1214,6 +1348,20 @@ impl Core {
 		})?;
 		log::debug!("Directory sync complete");
 
+		// Step 6: Final manifest upload to object store (direct, not via channel)
+		// Uses the actual manifest_id so read_latest_manifest() finds it.
+		let (manifest_id, manifest_bytes) = {
+			let manifest = self.inner.level_manifest.read()?;
+			(manifest.manifest_id, serialize_manifest(&manifest).ok())
+		};
+		if let Some(bytes) = manifest_bytes {
+			if let Err(e) =
+				self.inner.table_store.write_manifest(manifest_id, bytes::Bytes::from(bytes)).await
+			{
+				log::warn!("Failed final manifest upload during shutdown: {e}");
+			}
+		}
+
 		// Step 7: Release the database lock
 		let mut lockfile = self.inner.lockfile.lock()?;
 		lockfile.release()?;
@@ -1242,7 +1390,7 @@ pub struct Store {
 
 impl Store {
 	/// Creates a new Store with the specified options
-	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
+	pub(crate) async fn new(opts: Arc<Options>) -> Result<Self> {
 		// Validate options before creating the store
 		opts.validate()?;
 
@@ -1250,7 +1398,7 @@ impl Store {
 		Self::create_directory_structure(&opts)?;
 
 		// Create the core LSM components
-		let core = Core::new(Arc::clone(&opts))?;
+		let core = Core::new(Arc::clone(&opts)).await?;
 
 		// Ensure directory changes are persisted
 		sync_directory_structure(&opts)?;
@@ -1276,9 +1424,9 @@ impl Store {
 	// ===== Direct Single-Key Operations =====
 
 	/// Gets the value for a key at the current visible sequence number.
-	pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
+	pub async fn get(&self, key: &[u8]) -> Result<Option<Value>> {
 		let snapshot = self.new_snapshot();
-		snapshot.get(key).map(|opt| opt.map(|(v, _)| v))
+		snapshot.get(key).await.map(|opt| opt.map(|(v, _)| v))
 	}
 
 	/// Sets a key-value pair (creates a single-entry batch and applies it).
@@ -1339,123 +1487,95 @@ impl Store {
 		Snapshot::new(Arc::clone(&self.core))
 	}
 
-	/// Creates a database checkpoint at the specified directory.
+	// ===== Branching Operations =====
+
+	/// Creates a new branch from the current state.
 	///
-	/// This creates a consistent point-in-time snapshot that includes:
-	/// - All SSTables from all levels
-	/// - Current WAL segments
-	/// - Level manifest
-	/// - Checkpoint metadata
-	///
-	/// # Arguments
-	/// * `checkpoint_dir` - Directory where the checkpoint will be created
-	///
-	/// # Returns
-	/// Metadata about the created checkpoint
-	pub fn create_checkpoint<P: AsRef<Path>>(
-		&self,
-		checkpoint_dir: P,
-	) -> Result<CheckpointMetadata> {
-		let checkpoint = DatabaseCheckpoint::new(Arc::clone(&self.core.inner));
-		checkpoint.create_checkpoint(checkpoint_dir)
-	}
+	/// Uses two-phase creation to prevent GC race conditions:
+	/// 1. Register branch in registry (status="creating") — protects parent SSTs from purger
+	/// 2. Flush memtables and snapshot current manifest
+	/// 3. Write branch manifest (copy of parent with reset header)
+	/// 4. Update branch status to "active"
+	pub async fn create_branch(&self, branch_name: &str) -> Result<crate::branch::BranchInfo> {
+		use crate::branch::{
+			load_registry,
+			now_unix_secs,
+			save_registry,
+			BranchInfo,
+			BranchStatus,
+		};
+		use crate::manifest::{reset_manifest_for_branch, serialize_manifest};
+		use crate::paths::StorePaths;
 
-	/// Restores the database from a checkpoint directory.
-	pub fn restore_from_checkpoint<P: AsRef<Path>>(
-		&self,
-		checkpoint_dir: P,
-	) -> Result<CheckpointMetadata> {
-		// Step 1: Restore files from checkpoint
-		let checkpoint = DatabaseCheckpoint::new(Arc::clone(&self.core.inner));
-		let metadata = checkpoint.restore_from_checkpoint(checkpoint_dir)?;
+		let root: object_store::path::Path = self.core.inner.opts.object_store_root.as_str().into();
+		let os = &self.core.inner.opts.object_store;
 
-		// Step 2: Reload in-memory state to match restored files
+		// Load current registry
+		let mut registry = load_registry(os.as_ref(), &root).await?;
+		if registry.contains(branch_name) {
+			return Err(crate::error::Error::Other(format!(
+				"Branch already exists: {branch_name}"
+			)));
+		}
 
-		// Create a new LevelManifest from the current path
-		let new_levels = LevelManifest::new(Arc::clone(&self.core.inner.opts))?;
-
-		// Replace the current levels with the reloaded ones
+		// Flush all memtables so all data is in SSTs
 		{
-			let mut levels_guard = self.core.inner.level_manifest.write()?;
-			*levels_guard = new_levels;
+			let active = self.core.inner.active_memtable.read()?;
+			if !active.is_empty() {
+				drop(active);
+				self.core.inner.rotate_memtable()?;
+			}
 		}
+		self.core.inner.flush_all_immutables_sync().await?;
 
-		// Clear the current memtables since they would be stale after restore
-		// This discards any pending writes, which is correct for restore operations
-		{
-			let mut active_memtable = self.core.inner.active_memtable.write()?;
-			*active_memtable = Arc::new(MemTable::new(self.core.inner.opts.max_memtable_size));
-		}
-
-		{
-			let mut immutable_memtables = self.core.inner.immutable_memtables.write()?;
-			*immutable_memtables = ImmutableMemtables::default();
-		}
-
-		// Reopen the WAL from the restored directory
-		let wal_path = self.core.inner.opts.path.join("wal");
-		let manifest_log_number = self.core.inner.level_manifest.read()?.get_log_number();
-
-		{
-			let mut wal_guard = self.core.inner.wal.write();
-			let new_wal = Wal::open_with_min_log_number(
-				&wal_path,
-				manifest_log_number,
-				wal::Options::default(),
-			)?;
-			*wal_guard = new_wal;
-		}
-
-		// Replay any WAL entries that were restored
-		let (wal_seq_num_opt, recovered_memtable) = Core::replay_wal_with_repair(
-			&wal_path,
-			manifest_log_number,
-			"Database restore",
-			self.core.inner.opts.wal_recovery_mode,
-			self.core.inner.opts.max_memtable_size,
-			|memtable, wal_number| {
-				// Flush intermediate memtable to SST during recovery
-				let table_id = self.core.inner.level_manifest.read()?.next_table_id();
-				self.core.inner.flush_immutable_to_sst(
-					Arc::clone(&memtable),
-					table_id,
-					wal_number,
-				)?;
-				log::info!(
-					"Restore: flushed memtable to SST table_id={}, wal_number={}",
-					table_id,
-					wal_number
-				);
-				Ok(())
-			},
-		)?;
-
-		// Set recovered memtable as active (if any)
-		if let Some(memtable) = recovered_memtable {
-			let mut active_memtable = self.core.inner.active_memtable.write()?;
-			*active_memtable = memtable;
-		}
-
-		// Ensure the active memtable has the correct WAL number set
-		{
-			let active_memtable = self.core.inner.active_memtable.read()?;
-			let current_wal_number = self.core.inner.wal.read().get_active_log_number();
-			active_memtable.set_wal_number(current_wal_number);
-		}
-
-		// Get last_sequence from manifest
-		let manifest_last_seq = self.core.inner.level_manifest.read()?.get_last_sequence();
-
-		// Determine effective sequence number (same logic as Core::new)
-		let max_seq_num = match wal_seq_num_opt {
-			Some(wal_seq) => std::cmp::max(manifest_last_seq, wal_seq),
-			None => manifest_last_seq,
+		// Read current manifest under lock
+		let (manifest_id, last_sequence, manifest_bytes) = {
+			let manifest = self.core.inner.level_manifest.read()?;
+			let bytes = serialize_manifest(&manifest)?;
+			(manifest.manifest_id, manifest.last_sequence, bytes)
 		};
 
-		// Set visible sequence number
-		self.core.commit_pipeline.set_seq_num(max_seq_num);
+		// Ensure parent manifest is in object store before registering branch.
+		// The flush path uploads asynchronously via channel — there's no guarantee
+		// it's completed. The purger needs source_manifest_id to be readable for
+		// "Creating" branches to protect parent SSTs.
+		self.core
+			.inner
+			.table_store
+			.write_manifest(manifest_id, bytes::Bytes::from(manifest_bytes.clone()))
+			.await?;
 
-		Ok(metadata)
+		// PHASE A: Register branch FIRST (status="creating")
+		let info = BranchInfo {
+			name: branch_name.to_string(),
+			parent_branch: self.core.inner.opts.branch_name.clone(),
+			created_at: now_unix_secs(),
+			source_manifest_id: manifest_id,
+			source_sequence: last_sequence,
+			status: BranchStatus::Creating,
+		};
+		registry.insert(info.clone());
+		save_registry(os.as_ref(), &root, &registry).await?;
+
+		// PHASE B: Write branch manifest (copy of parent, with reset header)
+		let branch_resolver =
+			StorePaths::new_with_branch(root.clone(), Some(branch_name.to_string()));
+		let branch_table_store = CloudStore::new(Arc::clone(os), branch_resolver, None);
+		let reset_bytes = reset_manifest_for_branch(&manifest_bytes)?;
+		branch_table_store.write_manifest(1, bytes::Bytes::from(reset_bytes)).await?;
+
+		// Update branch status to "active"
+		registry.update_status(branch_name, BranchStatus::Active)?;
+		save_registry(os.as_ref(), &root, &registry).await?;
+
+		log::info!(
+			"Branch '{}' created from manifest_id={}, last_sequence={}",
+			branch_name,
+			manifest_id,
+			last_sequence
+		);
+
+		Ok(info)
 	}
 
 	pub async fn close(&self) -> Result<()> {
@@ -1465,7 +1585,7 @@ impl Store {
 	/// Flushes all memtables to disk synchronously.
 	/// This is a blocking operation that ensures all data is persisted before returning.
 	#[cfg(test)]
-	pub(crate) fn flush(&self) -> Result<()> {
+	pub(crate) async fn flush(&self) -> Result<()> {
 		// Step 1: Rotate active memtable if it has data
 		{
 			let active = self.core.inner.active_memtable.read()?;
@@ -1476,18 +1596,14 @@ impl Store {
 		}
 
 		// Step 2: Flush all immutable memtables synchronously
-		self.core.inner.flush_all_immutables_sync()?;
-
-		// Step 3: Signal stall controller that work completed
-		self.core.write_stall.signal_work_done();
+		self.core.inner.flush_all_immutables_sync().await?;
 
 		Ok(())
 	}
 
 	#[cfg(test)]
-	pub(crate) fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()> {
-		self.core.inner.compact(strategy)?;
-		self.core.write_stall.signal_work_done();
+	pub(crate) async fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()> {
+		self.core.inner.compact(strategy).await?;
 		Ok(())
 	}
 
@@ -1573,6 +1689,12 @@ impl StoreBuilder {
 		self
 	}
 
+	/// Sets the object store for SSTs and manifest storage.
+	pub fn with_object_store(mut self, store: Arc<dyn object_store::ObjectStore>) -> Self {
+		self.opts.object_store = store;
+		self
+	}
+
 	/// Disables compression for data blocks in SSTables.
 	///
 	/// Use this when compression overhead is not desired or when
@@ -1581,13 +1703,16 @@ impl StoreBuilder {
 	/// # Example
 	///
 	/// ```no_run
-	/// use surrealkv::TreeBuilder;
+	/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+	/// use surrealos::TreeBuilder;
 	///
 	/// let tree = TreeBuilder::new()
 	///     .with_path("./data".into())
 	///     .without_compression()
 	///     .build()
+	///     .await
 	///     .unwrap();
+	/// # });
 	/// ```
 	pub fn without_compression(mut self) -> Self {
 		self.opts = self.opts.without_compression();
@@ -1630,30 +1755,18 @@ impl StoreBuilder {
 		self
 	}
 
-	/// Set the memtable stall threshold.
-	pub fn with_memtable_stall_threshold(mut self, value: usize) -> Self {
-		self.opts = self.opts.with_memtable_stall_threshold(value);
-		self
-	}
-
-	/// Set the L0 stall threshold.
-	pub fn with_l0_stall_threshold(mut self, value: usize) -> Self {
-		self.opts = self.opts.with_l0_stall_threshold(value);
-		self
-	}
-
 	/// Builds the store with the configured options.
-	pub fn build(self) -> Result<Store> {
-		Store::new(Arc::new(self.opts))
+	pub async fn build(self) -> Result<Store> {
+		Store::new(Arc::new(self.opts)).await
 	}
 
 	/// Builds the store and returns both the store and the options.
 	///
 	/// This is useful when you need to keep a reference to the options
 	/// after creating the store.
-	pub fn build_with_options(self) -> Result<(Store, Arc<Options>)> {
+	pub async fn build_with_options(self) -> Result<(Store, Arc<Options>)> {
 		let opts = Arc::new(self.opts);
-		let store = Store::new(Arc::clone(&opts))?;
+		let store = Store::new(Arc::clone(&opts)).await?;
 		Ok((store, opts))
 	}
 }

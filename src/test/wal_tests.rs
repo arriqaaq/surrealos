@@ -96,44 +96,44 @@ fn test_cleanup_old_segments() {
 	);
 }
 
-#[test]
-fn test_wal_replay_all_segments() {
+#[test(tokio::test)]
+async fn test_wal_replay_all_segments() {
 	let temp_dir = create_test_wal_dir();
 
 	// Create WAL with manual rotation to create multiple segments
 	let opts = Options::default();
 	let mut wal = Wal::open(temp_dir.path(), opts).unwrap();
 
-	// Write batch to first segment (segment 0)
-	let mut batch1 = Batch::new(100);
+	// Write batch to first segment (segment 0) - seq 100-102
+	let mut batch1 = Batch::new_with_seq(100);
 	for i in 0..3 {
 		let key = format!("key_seg0_{i:02}");
 		let value = format!("value_seg0_{i:02}");
-		batch1.set(key.into_bytes(), value.into_bytes(), 0).unwrap();
+		batch1.set(key.into_bytes(), value.into_bytes()).unwrap();
 	}
 	wal.append(&batch1.encode().unwrap()).unwrap();
 
 	// Manually rotate to create second segment
 	wal.rotate().unwrap();
 
-	// Write batch to second segment (segment 1)
-	let mut batch2 = Batch::new(200);
+	// Write batch to second segment (segment 1) - seq 200-203
+	let mut batch2 = Batch::new_with_seq(200);
 	for i in 0..4 {
 		let key = format!("key_seg1_{i:02}");
 		let value = format!("value_seg1_{i:02}");
-		batch2.set(key.into_bytes(), value.into_bytes(), 0).unwrap();
+		batch2.set(key.into_bytes(), value.into_bytes()).unwrap();
 	}
 	wal.append(&batch2.encode().unwrap()).unwrap();
 
 	// Manually rotate to create third segment
 	wal.rotate().unwrap();
 
-	// Write batch to third segment (segment 2)
-	let mut batch3 = Batch::new(300);
+	// Write batch to third segment (segment 2) - seq 300-304
+	let mut batch3 = Batch::new_with_seq(300);
 	for i in 0..5 {
 		let key = format!("key_seg2_{i:02}");
 		let value = format!("value_seg2_{i:02}");
-		batch3.set(key.into_bytes(), value.into_bytes(), 0).unwrap();
+		batch3.set(key.into_bytes(), value.into_bytes()).unwrap();
 	}
 	wal.append(&batch3.encode().unwrap()).unwrap();
 
@@ -156,7 +156,7 @@ fn test_wal_replay_all_segments() {
 		let mut iter = memtable.iter();
 		while iter.valid() {
 			entry_count += 1;
-			iter.next().unwrap();
+			iter.next().await.unwrap();
 		}
 	}
 

@@ -379,8 +379,8 @@ mod tests {
 	use crate::wal::Options;
 	use crate::{LSMIterator, WalRecoveryMode};
 
-	#[test]
-	fn test_replay_wal_sequence_number_tracking() {
+	#[tokio::test]
+	async fn test_replay_wal_sequence_number_tracking() {
 		// Create a temporary directory for WAL files
 		let temp_dir = TempDir::new().unwrap();
 		let wal_dir = temp_dir.path();
@@ -394,19 +394,19 @@ mod tests {
 		// This verifies that ALL segments are replayed, not just the latest
 
 		// Batch 1: Starting at 100, with 3 entries (100, 101, 102)
-		let mut batch1 = Batch::new(100);
-		batch1.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap(); // seq_num 100
-		batch1.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap(); // seq_num 101
-		batch1.set(b"key3".to_vec(), b"value3".to_vec(), 0).unwrap(); // seq_num 102
-																// Highest sequence number should be 102
+		let mut batch1 = Batch::new_with_seq(100);
+		batch1.set(b"key1", b"value1").unwrap(); // seq_num 100
+		batch1.set(b"key2", b"value2").unwrap(); // seq_num 101
+		batch1.set(b"key3", b"value3").unwrap(); // seq_num 102
+										   // Highest sequence number should be 102
 
 		// Batch 2: Starting at 200, with 4 entries (200, 201, 202, 203)
-		let mut batch2 = Batch::new(200);
-		batch2.set(b"key4".to_vec(), b"value4".to_vec(), 0).unwrap(); // seq_num 200
-		batch2.set(b"key5".to_vec(), b"value5".to_vec(), 0).unwrap(); // seq_num 201
-		batch2.delete(b"key6".to_vec(), 0).unwrap(); // seq_num 202
-		batch2.set(b"key7".to_vec(), b"value7".to_vec(), 0).unwrap(); // seq_num 203
-																// Highest sequence number should be 203
+		let mut batch2 = Batch::new_with_seq(200);
+		batch2.set(b"key4", b"value4").unwrap(); // seq_num 200
+		batch2.set(b"key5", b"value5").unwrap(); // seq_num 201
+		batch2.delete(b"key6").unwrap(); // seq_num 202
+		batch2.set(b"key7", b"value7").unwrap(); // seq_num 203
+										   // Highest sequence number should be 203
 
 		// Create WAL and rotate to create 2 segments
 		let opts = Options::default();
@@ -439,7 +439,7 @@ mod tests {
 			let mut iter = memtable.iter();
 			while iter.valid() {
 				entry_count += 1;
-				iter.next().unwrap();
+				iter.next().await.unwrap();
 			}
 		}
 		assert_eq!(
@@ -459,22 +459,22 @@ mod tests {
 		assert_eq!(memtables.len(), 0, "Empty WAL directory should return no memtables");
 	}
 
-	#[test]
-	fn test_replay_wal_single_entry_batches() {
+	#[tokio::test]
+	async fn test_replay_wal_single_entry_batches() {
 		let temp_dir = TempDir::new().unwrap();
 		let wal_dir = temp_dir.path();
 		fs::create_dir_all(wal_dir).unwrap();
 
 		// Test with multiple single-entry batches across 3 WAL segments
 		// This tests that ALL segments are replayed, not just the latest
-		let mut batch1 = Batch::new(500);
-		batch1.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap(); // seq_num 500
+		let mut batch1 = Batch::new_with_seq(500);
+		batch1.set(b"key1", b"value1").unwrap(); // seq_num 500
 
-		let mut batch2 = Batch::new(600);
-		batch2.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap(); // seq_num 600
+		let mut batch2 = Batch::new_with_seq(600);
+		batch2.set(b"key2", b"value2").unwrap(); // seq_num 600
 
-		let mut batch3 = Batch::new(700);
-		batch3.set(b"key3".to_vec(), b"value3".to_vec(), 0).unwrap(); // seq_num 700
+		let mut batch3 = Batch::new_with_seq(700);
+		batch3.set(b"key3", b"value3").unwrap(); // seq_num 700
 
 		// Create WAL for all batches (use rotation to create three segments)
 		let opts = Options::default();
@@ -508,7 +508,7 @@ mod tests {
 			let mut iter = memtable.iter();
 			while iter.valid() {
 				entry_count += 1;
-				iter.next().unwrap();
+				iter.next().await.unwrap();
 			}
 		}
 		assert_eq!(
@@ -517,23 +517,23 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn test_replay_wal_multiple_batches() {
+	#[tokio::test]
+	async fn test_replay_wal_multiple_batches() {
 		let temp_dir = TempDir::new().unwrap();
 		let wal_dir = temp_dir.path();
 		fs::create_dir_all(wal_dir).unwrap();
 
 		// Test case: Multiple batches across 2 WAL segments
 		// This ensures ALL segments are replayed and max tracking works correctly
-		let mut batch1 = Batch::new(200); // Starting sequence number 200
-		batch1.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap(); // seq_num 200
-		batch1.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap(); // seq_num 201
-																// Highest sequence number should be 201
+		let mut batch1 = Batch::new_with_seq(200); // Starting sequence number 200
+		batch1.set(b"key1", b"value1").unwrap(); // seq_num 200
+		batch1.set(b"key2", b"value2").unwrap(); // seq_num 201
+										   // Highest sequence number should be 201
 
-		let mut batch2 = Batch::new(300); // Starting sequence number 300
-		batch2.set(b"key3".to_vec(), b"value3".to_vec(), 0).unwrap(); // seq_num 300
-		batch2.set(b"key4".to_vec(), b"value4".to_vec(), 0).unwrap(); // seq_num 301
-																// Highest sequence number should be 301
+		let mut batch2 = Batch::new_with_seq(300); // Starting sequence number 300
+		batch2.set(b"key3", b"value3").unwrap(); // seq_num 300
+		batch2.set(b"key4", b"value4").unwrap(); // seq_num 301
+										   // Highest sequence number should be 301
 
 		// Create WAL and rotate to create 2 segments
 		let opts = Options::default();
@@ -565,7 +565,7 @@ mod tests {
 			let mut iter = memtable.iter();
 			while iter.valid() {
 				entry_count += 1;
-				iter.next().unwrap();
+				iter.next().await.unwrap();
 			}
 		}
 
@@ -583,8 +583,8 @@ mod tests {
 		assert!(result.is_err(), "Should fail when segment doesn't exist");
 	}
 
-	#[test]
-	fn test_post_corruption_replay() {
+	#[tokio::test]
+	async fn test_post_corruption_replay() {
 		let temp_dir = TempDir::new().unwrap();
 		let wal_dir = temp_dir.path();
 		fs::create_dir_all(wal_dir).unwrap();
@@ -594,9 +594,9 @@ mod tests {
 		let mut wal = Wal::open(wal_dir, opts).unwrap();
 
 		// Add some valid data
-		let mut batch1 = Batch::new(100);
-		batch1.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap();
-		batch1.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap();
+		let mut batch1 = Batch::new();
+		batch1.set(b"key1", b"value1").unwrap();
+		batch1.set(b"key2", b"value2").unwrap();
 
 		wal.append(&batch1.encode().unwrap()).unwrap();
 		wal.close().unwrap();
@@ -628,11 +628,12 @@ mod tests {
 			"Test repair",
 			WalRecoveryMode::TolerateCorruptedWithRepair,
 			1024,
-			|_memtable, _wal_number| {
+			|_memtable, _wal_number| async {
 				// Flush callback - not needed for this test
 				Ok(())
 			},
 		)
+		.await
 		.unwrap();
 
 		// Verify the repair worked correctly
@@ -643,8 +644,8 @@ mod tests {
 		assert!(memtable_opt.is_none(), "Should have no memtable when first record is corrupted");
 	}
 
-	#[test]
-	fn test_repair_with_three_batches_corrupt_third() {
+	#[tokio::test]
+	async fn test_repair_with_three_batches_corrupt_third() {
 		let temp_dir = TempDir::new().unwrap();
 		let wal_dir = temp_dir.path();
 		fs::create_dir_all(wal_dir).unwrap();
@@ -654,17 +655,17 @@ mod tests {
 		let mut wal = Wal::open(wal_dir, opts).unwrap();
 
 		// Create three batches with different sequence numbers
-		let mut batch1 = Batch::new(100);
-		batch1.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap();
-		batch1.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap();
+		let mut batch1 = Batch::new_with_seq(100);
+		batch1.set(b"key1", b"value1").unwrap();
+		batch1.set(b"key2", b"value2").unwrap();
 
-		let mut batch2 = Batch::new(200);
-		batch2.set(b"key3".to_vec(), b"value3".to_vec(), 0).unwrap();
-		batch2.set(b"key4".to_vec(), b"value4".to_vec(), 0).unwrap();
+		let mut batch2 = Batch::new_with_seq(200);
+		batch2.set(b"key3", b"value3").unwrap();
+		batch2.set(b"key4", b"value4").unwrap();
 
-		let mut batch3 = Batch::new(300);
-		batch3.set(b"key5".to_vec(), b"value5".to_vec(), 0).unwrap();
-		batch3.set(b"key6".to_vec(), b"value6".to_vec(), 0).unwrap();
+		let mut batch3 = Batch::new_with_seq(300);
+		batch3.set(b"key5", b"value5").unwrap();
+		batch3.set(b"key6", b"value6").unwrap();
 
 		// Encode all batches
 		let encoded1 = batch1.encode().unwrap();
@@ -709,11 +710,12 @@ mod tests {
 			"Test repair",
 			WalRecoveryMode::TolerateCorruptedWithRepair,
 			1024,
-			|_memtable, _wal_number| {
+			|_memtable, _wal_number| async {
 				// Flush callback - not needed for this test
 				Ok(())
 			},
 		)
+		.await
 		.unwrap();
 
 		// Verify the repair worked correctly
@@ -732,7 +734,7 @@ mod tests {
 			let mut iter = memtable.iter();
 			while iter.valid() {
 				entry_count += 1;
-				iter.next().unwrap();
+				iter.next().await.unwrap();
 			}
 
 			assert_eq!(entry_count, 4, "Should have recovered 4 entries from first two batches");
@@ -753,12 +755,12 @@ mod tests {
 		let opts = Options::default();
 		let mut wal = Wal::open(wal_dir, opts).unwrap();
 
-		let mut batch1 = Batch::new(100);
-		batch1.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap();
+		let mut batch1 = Batch::new();
+		batch1.set(b"key1", b"value1").unwrap();
 		wal.append(&batch1.encode().unwrap()).unwrap();
 
-		let mut batch2 = Batch::new(200);
-		batch2.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap();
+		let mut batch2 = Batch::new();
+		batch2.set(b"key2", b"value2").unwrap();
 		wal.append(&batch2.encode().unwrap()).unwrap();
 
 		wal.close().unwrap();
@@ -795,8 +797,8 @@ mod tests {
 		let opts = Options::default();
 		let mut wal = Wal::open(wal_dir, opts).unwrap();
 
-		let mut batch = Batch::new(100);
-		batch.set(b"key".to_vec(), b"value".to_vec(), 0).unwrap();
+		let mut batch = Batch::new();
+		batch.set(b"key", b"value").unwrap();
 		wal.append(&batch.encode().unwrap()).unwrap();
 		wal.close().unwrap();
 
@@ -818,8 +820,8 @@ mod tests {
 		let opts = Options::default();
 		let mut wal = Wal::open(wal_dir, opts).unwrap();
 
-		let mut batch = Batch::new(100);
-		batch.set(b"key".to_vec(), b"value".to_vec(), 0).unwrap();
+		let mut batch = Batch::new_with_seq(100);
+		batch.set(b"key", b"value").unwrap();
 		wal.append(&batch.encode().unwrap()).unwrap();
 		wal.close().unwrap();
 
@@ -832,8 +834,8 @@ mod tests {
 		// Reporter is used internally for logging
 	}
 
-	#[test]
-	fn test_multi_segment_recovery_after_crash() {
+	#[tokio::test]
+	async fn test_multi_segment_recovery_after_crash() {
 		use crate::batch::Batch;
 
 		let temp_dir = TempDir::new().unwrap();
@@ -844,9 +846,9 @@ mod tests {
 		// This is the critical bug scenario that was causing data loss
 
 		// Create first batch in WAL segment 0
-		let mut batch1 = Batch::new(100);
-		batch1.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap();
-		batch1.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap();
+		let mut batch1 = Batch::new_with_seq(100);
+		batch1.set(b"key1", b"value1").unwrap();
+		batch1.set(b"key2", b"value2").unwrap();
 
 		let opts = Options::default();
 		let mut wal = Wal::open(wal_dir, opts).unwrap();
@@ -856,9 +858,9 @@ mod tests {
 		wal.rotate().unwrap();
 
 		// Create second batch in WAL segment 1
-		let mut batch2 = Batch::new(200);
-		batch2.set(b"key3".to_vec(), b"value3".to_vec(), 0).unwrap();
-		batch2.set(b"key4".to_vec(), b"value4".to_vec(), 0).unwrap();
+		let mut batch2 = Batch::new_with_seq(200);
+		batch2.set(b"key3", b"value3").unwrap();
+		batch2.set(b"key4", b"value4").unwrap();
 
 		wal.append(&batch2.encode().unwrap()).unwrap();
 
@@ -885,7 +887,7 @@ mod tests {
 			let mut iter = memtable.iter();
 			while iter.valid() {
 				entry_count += 1;
-				iter.next().unwrap();
+				iter.next().await.unwrap();
 			}
 		}
 
@@ -908,22 +910,22 @@ mod tests {
 		let mut wal = Wal::open(wal_dir, opts).unwrap();
 
 		// Segment 0: valid data
-		let mut batch0 = Batch::new(100);
-		batch0.set(b"key0".to_vec(), b"value0".to_vec(), 0).unwrap();
+		let mut batch0 = Batch::new();
+		batch0.set(b"key0", b"value0").unwrap();
 		wal.append(&batch0.encode().unwrap()).unwrap();
 		wal.rotate().unwrap();
 
 		// Segment 1: will be corrupted
-		let mut batch1 = Batch::new(200);
-		batch1.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap();
+		let mut batch1 = Batch::new();
+		batch1.set(b"key1", b"value1").unwrap();
 		let encoded1 = batch1.encode().unwrap();
 		wal.append(&encoded1).unwrap();
 		wal.rotate().unwrap();
 
 		// Segment 2: valid data (should NOT be processed due to corruption in segment
 		// 1)
-		let mut batch2 = Batch::new(300);
-		batch2.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap();
+		let mut batch2 = Batch::new();
+		batch2.set(b"key2", b"value2").unwrap();
 		wal.append(&batch2.encode().unwrap()).unwrap();
 		wal.close().unwrap();
 
@@ -965,8 +967,8 @@ mod tests {
 		// This is correct behavior - corruption stops recovery
 	}
 
-	#[test]
-	fn test_multi_wal_recovery_creates_multiple_memtables() {
+	#[tokio::test]
+	async fn test_multi_wal_recovery_creates_multiple_memtables() {
 		let temp_dir = TempDir::new().unwrap();
 		let wal_dir = temp_dir.path();
 		fs::create_dir_all(wal_dir).unwrap();
@@ -976,20 +978,20 @@ mod tests {
 		let mut wal = Wal::open(wal_dir, opts).unwrap();
 
 		// Segment 0
-		let mut batch0 = Batch::new(100);
-		batch0.set(b"key0".to_vec(), b"value0".to_vec(), 0).unwrap();
+		let mut batch0 = Batch::new_with_seq(100);
+		batch0.set(b"key0", b"value0").unwrap();
 		wal.append(&batch0.encode().unwrap()).unwrap();
 		wal.rotate().unwrap();
 
 		// Segment 1
-		let mut batch1 = Batch::new(200);
-		batch1.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap();
+		let mut batch1 = Batch::new_with_seq(200);
+		batch1.set(b"key1", b"value1").unwrap();
 		wal.append(&batch1.encode().unwrap()).unwrap();
 		wal.rotate().unwrap();
 
 		// Segment 2
-		let mut batch2 = Batch::new(300);
-		batch2.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap();
+		let mut batch2 = Batch::new_with_seq(300);
+		batch2.set(b"key2", b"value2").unwrap();
 		wal.append(&batch2.encode().unwrap()).unwrap();
 		wal.close().unwrap();
 
@@ -1008,11 +1010,11 @@ mod tests {
 		// Verify each memtable has correct data
 		{
 			let mut iter = memtables[0].0.iter();
-			iter.seek_first().unwrap();
+			iter.seek_first().await.unwrap();
 			let mut count = 0;
 			while iter.valid() {
 				count += 1;
-				if !iter.next().unwrap() {
+				if !iter.next().await.unwrap() {
 					break;
 				}
 			}
@@ -1020,11 +1022,11 @@ mod tests {
 		}
 		{
 			let mut iter = memtables[1].0.iter();
-			iter.seek_first().unwrap();
+			iter.seek_first().await.unwrap();
 			let mut count = 0;
 			while iter.valid() {
 				count += 1;
-				if !iter.next().unwrap() {
+				if !iter.next().await.unwrap() {
 					break;
 				}
 			}
@@ -1032,11 +1034,11 @@ mod tests {
 		}
 		{
 			let mut iter = memtables[2].0.iter();
-			iter.seek_first().unwrap();
+			iter.seek_first().await.unwrap();
 			let mut count = 0;
 			while iter.valid() {
 				count += 1;
-				if !iter.next().unwrap() {
+				if !iter.next().await.unwrap() {
 					break;
 				}
 			}

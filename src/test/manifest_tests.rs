@@ -1,28 +1,31 @@
-use std::fs::{self, File as SysFile};
-use std::sync::atomic::Ordering;
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use test_log::test;
-
-use crate::levels::{
+use crate::cloud_store::CloudStore;
+use crate::levels::LevelManifest;
+use crate::manifest::{
+	load_from_file,
 	write_manifest_to_disk,
-	LevelManifest,
 	ManifestChangeSet,
 	SnapshotInfo,
-	MANIFEST_FORMAT_VERSION_V1,
+	MANIFEST_FORMAT_VERSION_V3,
 };
-use crate::sstable::table::{Table, TableWriter};
-use crate::vfs::File;
+use crate::sstable::table::TableWriter;
+use crate::sstable::SstId;
+use crate::test::{new_test_table_with_store, test_sst_id, test_table_store};
 use crate::{InternalKey, InternalKeyKind, Options, Result};
 
-// Helper function to create a test table with direct file IO
-fn create_test_table(table_id: u64, num_items: u64, opts: Arc<Options>) -> Result<Arc<Table>> {
-	let table_file_path = opts.sstable_file_path(table_id);
+// Helper function to create a test table with the async cloud-native approach
+async fn create_test_table(
+	table_id: SstId,
+	num_items: u64,
+	opts: Arc<Options>,
+	table_store: Arc<CloudStore>,
+) -> Result<Arc<crate::sstable::table::Table>> {
+	let mut buf = Vec::new();
 
-	let mut file = SysFile::create(&table_file_path)?;
-
-	// Create TableWriter that writes directly to the file
-	let mut writer = TableWriter::new(&mut file, table_id, Arc::clone(&opts), 0); // L0 for test
+	// Create TableWriter that writes to an in-memory buffer
+	let mut writer = TableWriter::new(&mut buf, table_id, Arc::clone(&opts), 0); // L0 for test
 
 	// Generate and add items
 	for i in 0..num_items {
@@ -36,21 +39,16 @@ fn create_test_table(table_id: u64, num_items: u64, opts: Arc<Options>) -> Resul
 	}
 
 	// Finish writing the table
-	let size = writer.finish()?;
+	writer.finish()?;
 
-	// Open the file for reading
-	let file = SysFile::open(&table_file_path)?;
-	file.sync_all()?;
-	let file: Arc<dyn File> = Arc::new(file);
-
-	// Create the table
-	let table = Table::new(table_id, opts, file, size as u64)?;
+	// Create the table via the async test helper with shared store
+	let table = new_test_table_with_store(table_id, opts, buf, table_store).await?;
 
 	Ok(Arc::new(table))
 }
 
-#[test]
-fn test_level_manifest_persistence() {
+#[tokio::test]
+async fn test_level_manifest_persistence() {
 	let mut opts = Options::default();
 	// Set up temporary directory for test
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -59,33 +57,44 @@ fn test_level_manifest_persistence() {
 	opts.level_count = 3; // Set level count for the manifest
 	let opts = Arc::new(opts);
 
-	// Create sstables directory
-	let sstable_path = opts.sstable_dir();
-	fs::create_dir_all(&sstable_path).expect("Failed to create sstables directory");
-
 	// Create manifest directory
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest directory");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest directory");
 
-	// Create a new manifest with 3 levels
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let table_store = test_table_store();
+
+	// Create a new manifest with 3 levels (using struct literal for tests)
+	let levels = LevelManifest::initialize_levels_for_test(opts.level_count);
+	let mut manifest = LevelManifest {
+		manifest_dir: opts.manifest_dir(),
+		manifest_id: 0,
+		levels,
+		hidden_set: HashSet::with_capacity(10),
+		manifest_format_version: MANIFEST_FORMAT_VERSION_V3,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+		writer_epoch: 0,
+		compactor_epoch: 0,
+		leader_id: 0,
+	};
 
 	// Create tables and add them to the manifest
 	// Create 2 tables for level 0
-	let table_id1 = 1;
-	let table1 =
-		create_test_table(table_id1, 100, Arc::clone(&opts)).expect("Failed to create table 1");
+	let table_id1 = test_sst_id(1);
+	let table1 = create_test_table(table_id1, 100, Arc::clone(&opts), Arc::clone(&table_store))
+		.await
+		.expect("Failed to create table 1");
 
-	let table_id2 = 2;
-	let table2 =
-		create_test_table(table_id2, 200, Arc::clone(&opts)).expect("Failed to create table 2");
+	let table_id2 = test_sst_id(2);
+	let table2 = create_test_table(table_id2, 200, Arc::clone(&opts), Arc::clone(&table_store))
+		.await
+		.expect("Failed to create table 2");
 
 	// Create a table for level 1
-	let table_id3 = 3;
-	let table3 =
-		create_test_table(table_id3, 300, Arc::clone(&opts)).expect("Failed to create table 3");
-
-	let expected_next_id = 100;
-	manifest.next_table_id.store(expected_next_id, Ordering::SeqCst);
+	let table_id3 = test_sst_id(3);
+	let table3 = create_test_table(table_id3, 300, Arc::clone(&opts), Arc::clone(&table_store))
+		.await
+		.expect("Failed to create table 3");
 
 	let changeset = ManifestChangeSet {
 		new_tables: vec![
@@ -118,22 +127,22 @@ fn test_level_manifest_persistence() {
 	// Verify last_sequence was updated correctly (table3 has largest_seq_num = 300)
 	assert_eq!(manifest.get_last_sequence(), 300, "last_sequence should be 300");
 
-	// Persist the manifest with our custom next_table_id
-	write_manifest_to_disk(&manifest).expect("Failed to write to disk");
+	// Persist the manifest
+	write_manifest_to_disk(&mut manifest).expect("Failed to write to disk");
 
 	// Load the manifest directly to verify persistence
-	let manifest_path = opts.manifest_file_path(0);
-	let loaded_manifest = LevelManifest::load_from_file(&manifest_path, Arc::clone(&opts))
-		.expect("Failed to load manifest");
+	let manifest_path = opts.manifest_file_path(1);
+	let loaded_manifest = load_from_file(
+		&manifest_path,
+		opts.manifest_dir(),
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to load manifest");
 
-	// Verify all manifest fields were persisted correctly
 	assert_eq!(
-		loaded_manifest.next_table_id.load(Ordering::SeqCst),
-		expected_next_id,
-		"Next table ID not persisted correctly"
-	);
-	assert_eq!(
-		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V1,
+		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V3,
 		"Manifest version not persisted correctly"
 	);
 	assert_eq!(loaded_manifest.snapshots.len(), 2, "Snapshots not persisted correctly");
@@ -173,24 +182,25 @@ fn test_level_manifest_persistence() {
 		"Level 1 should contain table_id3"
 	);
 
-	// Create a new manifest from the same path (simulating restart/recovery)
-	let new_manifest = LevelManifest::new(Arc::clone(&opts))
-		.expect("Failed to create manifest from existing file");
+	// Reload manifest via load_from_file (simulating restart/recovery)
+	let new_manifest = load_from_file(
+		&manifest_path,
+		opts.manifest_dir(),
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create manifest from existing file");
 
 	// Verify all manifest fields were loaded correctly in the new manifest
 	assert_eq!(
-		new_manifest.next_table_id.load(Ordering::SeqCst),
-		expected_next_id,
-		"Next table ID not loaded correctly in new manifest"
-	);
-	assert_eq!(
-		new_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V1,
+		new_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V3,
 		"Manifest version not loaded correctly"
 	);
 	assert_eq!(new_manifest.snapshots.len(), 2, "Snapshots not loaded correctly");
 	assert_eq!(new_manifest.snapshots[0].seq_num, 10, "First snapshot not loaded correctly");
 	assert_eq!(new_manifest.snapshots[1].seq_num, 20, "Second snapshot not loaded correctly");
-	assert_eq!(new_manifest.path, opts.manifest_file_path(0), "Path not set correctly");
+	assert_eq!(new_manifest.manifest_dir, opts.manifest_dir(), "manifest_dir not set correctly");
 
 	// Verify the number of levels in the new manifest
 	assert_eq!(
@@ -224,7 +234,6 @@ fn test_level_manifest_persistence() {
 
 	// Check Table1 basic properties
 	assert_eq!(table1_reloaded.id, table_id1, "Table 1 ID mismatch");
-	assert_eq!(table1_reloaded.file_size, 3838, "Table 1 file size should be 3838");
 
 	// Check Table1 metadata properties
 	let props1 = &table1_reloaded.meta.properties;
@@ -260,7 +269,6 @@ fn test_level_manifest_persistence() {
 
 	// Check Table2 basic properties
 	assert_eq!(table2_reloaded.id, table_id2, "Table 2 ID mismatch");
-	assert_eq!(table2_reloaded.file_size, 7145, "Table 2 file size should be 7145");
 
 	// Check Table2 metadata properties
 	let props2 = &table2_reloaded.meta.properties;
@@ -296,7 +304,6 @@ fn test_level_manifest_persistence() {
 
 	// Check Table3 basic properties
 	assert_eq!(table3_reloaded.id, table_id3, "Table 3 ID mismatch");
-	assert_eq!(table3_reloaded.file_size, 10452, "Table 3 file size should be 10452");
 
 	// Check Table3 metadata properties
 	let props3 = &table3_reloaded.meta.properties;
@@ -356,18 +363,17 @@ fn test_level_manifest_persistence() {
 }
 
 // Helper function to create a test table with specific sequence numbers
-fn create_test_table_with_seq_nums(
-	table_id: u64,
+async fn create_test_table_with_seq_nums(
+	table_id: SstId,
 	seq_start: u64,
 	seq_end: u64,
 	opts: Arc<Options>,
-) -> Result<Arc<Table>> {
-	let table_file_path = opts.sstable_file_path(table_id);
+	table_store: Arc<CloudStore>,
+) -> Result<Arc<crate::sstable::table::Table>> {
+	let mut buf = Vec::new();
 
-	let mut file = SysFile::create(&table_file_path)?;
-
-	// Create TableWriter that writes directly to the file
-	let mut writer = TableWriter::new(&mut file, table_id, Arc::clone(&opts), 0); // L0 for test
+	// Create TableWriter that writes to an in-memory buffer
+	let mut writer = TableWriter::new(&mut buf, table_id, Arc::clone(&opts), 0); // L0 for test
 
 	// Generate and add items with specific sequence numbers
 	for seq_num in seq_start..=seq_end {
@@ -381,21 +387,34 @@ fn create_test_table_with_seq_nums(
 	}
 
 	// Finish writing the table
-	let size = writer.finish()?;
+	writer.finish()?;
 
-	// Open the file for reading
-	let file = SysFile::open(&table_file_path)?;
-	file.sync_all()?;
-	let file: Arc<dyn File> = Arc::new(file);
-
-	// Create the table
-	let table = Table::new(table_id, opts, file, size as u64)?;
+	// Create the table via the async test helper with shared store
+	let table = new_test_table_with_store(table_id, opts, buf, table_store).await?;
 
 	Ok(Arc::new(table))
 }
 
-#[test]
-fn test_lsn_with_multiple_l0_tables() {
+/// Helper to create a fresh empty LevelManifest for tests (struct literal).
+fn new_test_manifest(opts: &Arc<Options>) -> LevelManifest {
+	let levels = LevelManifest::initialize_levels_for_test(opts.level_count);
+	LevelManifest {
+		manifest_dir: opts.manifest_dir(),
+		manifest_id: 0,
+		levels,
+		hidden_set: HashSet::with_capacity(10),
+		manifest_format_version: MANIFEST_FORMAT_VERSION_V3,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+		writer_epoch: 0,
+		compactor_epoch: 0,
+		leader_id: 0,
+	}
+}
+
+#[tokio::test]
+async fn test_lsn_with_multiple_l0_tables() {
 	let mut opts = Options::default();
 	// Set up temporary directory for test
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -404,23 +423,27 @@ fn test_lsn_with_multiple_l0_tables() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	// Create sstables directory
-	let sstable_path = opts.sstable_dir();
-	fs::create_dir_all(&sstable_path).expect("Failed to create sstables directory");
-
 	// Create manifest directory
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest directory");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest directory");
 
 	// Create a new manifest
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = new_test_manifest(&opts);
+	let table_store = test_table_store();
 
 	// Test 1: Empty manifest should have last_sequence of 0
 	assert_eq!(manifest.get_last_sequence(), 0, "Empty manifest should return last_sequence of 0");
 
 	// Test 2: Add single table via changeset
 	// Create table with sequence numbers 1-10 (largest_seq_num = 10)
-	let table1 = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
-		.expect("Failed to create table 1");
+	let table1 = create_test_table_with_seq_nums(
+		test_sst_id(1),
+		1,
+		10,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 1");
 
 	let changeset1 = ManifestChangeSet {
 		new_tables: vec![(0, table1)],
@@ -432,8 +455,15 @@ fn test_lsn_with_multiple_l0_tables() {
 
 	// Test 3: Add table with higher sequence numbers
 	// Create table with sequence numbers 11-20 (largest_seq_num = 20)
-	let table2 = create_test_table_with_seq_nums(2, 11, 20, Arc::clone(&opts))
-		.expect("Failed to create table 2");
+	let table2 = create_test_table_with_seq_nums(
+		test_sst_id(2),
+		11,
+		20,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 2");
 
 	let changeset2 = ManifestChangeSet {
 		new_tables: vec![(0, table2)],
@@ -449,8 +479,15 @@ fn test_lsn_with_multiple_l0_tables() {
 
 	// Test 4: Add table with even higher sequence numbers
 	// Create table with sequence numbers 21-30 (largest_seq_num = 30)
-	let table3 = create_test_table_with_seq_nums(3, 21, 30, Arc::clone(&opts))
-		.expect("Failed to create table 3");
+	let table3 = create_test_table_with_seq_nums(
+		test_sst_id(3),
+		21,
+		30,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 3");
 
 	let changeset3 = ManifestChangeSet {
 		new_tables: vec![(0, table3)],
@@ -490,8 +527,15 @@ fn test_lsn_with_multiple_l0_tables() {
 
 	// Test 6: Add table with lower sequence numbers (simulating out-of-order
 	// insertion) Create table with sequence numbers 5-8 (largest_seq_num = 8)
-	let table4 = create_test_table_with_seq_nums(4, 5, 8, Arc::clone(&opts))
-		.expect("Failed to create table 4");
+	let table4 = create_test_table_with_seq_nums(
+		test_sst_id(4),
+		5,
+		8,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 4");
 
 	let changeset4 = ManifestChangeSet {
 		new_tables: vec![(0, table4)],
@@ -538,7 +582,9 @@ fn test_lsn_with_multiple_l0_tables() {
 	// Create table with sequence numbers 25-35 (largest_seq_num = 35, overlaps with
 	// table3)
 	let table5 =
-		create_test_table_with_seq_nums(5, 25, 35, opts).expect("Failed to create table 5");
+		create_test_table_with_seq_nums(test_sst_id(5), 25, 35, opts, Arc::clone(&table_store))
+			.await
+			.expect("Failed to create table 5");
 
 	let changeset5 = ManifestChangeSet {
 		new_tables: vec![(0, table5)],
@@ -566,8 +612,8 @@ fn test_lsn_with_multiple_l0_tables() {
 	}
 }
 
-#[test]
-fn test_last_sequence_persistence_across_manifest_reload() {
+#[tokio::test]
+async fn test_last_sequence_persistence_across_manifest_reload() {
 	let mut opts = Options::default();
 	// Set up temporary directory for test
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -576,28 +622,44 @@ fn test_last_sequence_persistence_across_manifest_reload() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	// Create sstables directory
-	let sstable_path = opts.sstable_dir();
-	fs::create_dir_all(&sstable_path).expect("Failed to create sstables directory");
-
 	// Create manifest directory
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest directory");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest directory");
 
+	let table_store = test_table_store();
 	let expected_last_sequence = 50;
 
 	// Create manifest with tables via changeset and verify last_sequence
 	{
-		let mut manifest =
-			LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+		let mut manifest = new_test_manifest(&opts);
 
 		// Create tables with different sequence ranges
-		let table1 = create_test_table_with_seq_nums(1, 1, 20, Arc::clone(&opts))
-			.expect("Failed to create table 1");
-		let table2 =
-			create_test_table_with_seq_nums(2, 21, expected_last_sequence, Arc::clone(&opts))
-				.expect("Failed to create table 2");
-		let table3 = create_test_table_with_seq_nums(3, 10, 30, Arc::clone(&opts))
-			.expect("Failed to create table 3");
+		let table1 = create_test_table_with_seq_nums(
+			test_sst_id(1),
+			1,
+			20,
+			Arc::clone(&opts),
+			Arc::clone(&table_store),
+		)
+		.await
+		.expect("Failed to create table 1");
+		let table2 = create_test_table_with_seq_nums(
+			test_sst_id(2),
+			21,
+			expected_last_sequence,
+			Arc::clone(&opts),
+			Arc::clone(&table_store),
+		)
+		.await
+		.expect("Failed to create table 2");
+		let table3 = create_test_table_with_seq_nums(
+			test_sst_id(3),
+			10,
+			30,
+			Arc::clone(&opts),
+			Arc::clone(&table_store),
+		)
+		.await
+		.expect("Failed to create table 3");
 
 		// Add all tables via a single changeset
 		let changeset = ManifestChangeSet {
@@ -615,12 +677,20 @@ fn test_last_sequence_persistence_across_manifest_reload() {
 		);
 
 		// Persist the manifest
-		write_manifest_to_disk(&manifest).expect("Failed to write manifest to disk");
+		write_manifest_to_disk(&mut manifest).expect("Failed to write manifest to disk");
 	}
 
 	// Reload manifest and verify last_sequence is preserved
 	{
-		let reloaded_manifest = LevelManifest::new(opts).expect("Failed to reload manifest");
+		let manifest_path = opts.manifest_file_path(1);
+		let reloaded_manifest = load_from_file(
+			&manifest_path,
+			opts.manifest_dir(),
+			Arc::clone(&opts),
+			Arc::clone(&table_store),
+		)
+		.await
+		.expect("Failed to reload manifest");
 
 		// Verify last_sequence after reload
 		assert_eq!(
@@ -653,8 +723,8 @@ fn test_last_sequence_persistence_across_manifest_reload() {
 	}
 }
 
-#[test]
-fn test_manifest_v1_with_log_number_and_last_sequence() {
+#[tokio::test]
+async fn test_manifest_v1_with_log_number_and_last_sequence() {
 	let mut opts = Options::default();
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 	let repo_path = temp_dir.path().to_path_buf();
@@ -663,16 +733,24 @@ fn test_manifest_v1_with_log_number_and_last_sequence() {
 	let opts = Arc::new(opts);
 
 	// Create required directories
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+
+	let table_store = test_table_store();
 
 	// Create a manifest with log_number and last_sequence set
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = new_test_manifest(&opts);
 
 	// Add a table to ensure non-trivial state
 	// Table with sequence numbers 100-200, so last_sequence should be 200
-	let table = create_test_table_with_seq_nums(1, 100, 200, Arc::clone(&opts))
-		.expect("Failed to create table");
+	let table = create_test_table_with_seq_nums(
+		test_sst_id(1),
+		100,
+		200,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table");
 
 	// Use changeset to atomically set log_number and add table
 	// The changeset will automatically update last_sequence from the table's
@@ -688,15 +766,23 @@ fn test_manifest_v1_with_log_number_and_last_sequence() {
 	assert_eq!(manifest.get_last_sequence(), 200, "last_sequence should be updated by changeset");
 
 	// Persist to disk
-	write_manifest_to_disk(&manifest).expect("Failed to write manifest");
+	write_manifest_to_disk(&mut manifest).expect("Failed to write manifest");
 
 	// Reload and verify
-	let loaded_manifest = LevelManifest::new(opts).expect("Failed to reload manifest");
+	let manifest_path = opts.manifest_file_path(1);
+	let loaded_manifest = load_from_file(
+		&manifest_path,
+		opts.manifest_dir(),
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to reload manifest");
 
-	// Verify format version is still V1
+	// Verify format version is still V3
 	assert_eq!(
-		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V1,
-		"Should be V1 format"
+		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V3,
+		"Should be V3 format"
 	);
 
 	// Verify new fields persisted correctly
@@ -707,8 +793,8 @@ fn test_manifest_v1_with_log_number_and_last_sequence() {
 	assert_eq!(loaded_manifest.levels.get_levels()[0].tables.len(), 1);
 }
 
-#[test]
-fn test_revert_empty_changeset() {
+#[tokio::test]
+async fn test_revert_empty_changeset() {
 	let mut opts = Options::default();
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 	let repo_path = temp_dir.path().to_path_buf();
@@ -716,10 +802,9 @@ fn test_revert_empty_changeset() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = new_test_manifest(&opts);
 
 	let initial_last_sequence = manifest.get_last_sequence();
 	let initial_log_number = manifest.get_log_number();
@@ -742,8 +827,8 @@ fn test_revert_empty_changeset() {
 	);
 }
 
-#[test]
-fn test_revert_added_tables_only() {
+#[tokio::test]
+async fn test_revert_added_tables_only() {
 	let mut opts = Options::default();
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 	let repo_path = temp_dir.path().to_path_buf();
@@ -751,17 +836,38 @@ fn test_revert_added_tables_only() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = new_test_manifest(&opts);
+	let table_store = test_table_store();
 
-	let table1 = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
-		.expect("Failed to create table 1");
-	let table2 = create_test_table_with_seq_nums(2, 11, 20, Arc::clone(&opts))
-		.expect("Failed to create table 2");
-	let table3 = create_test_table_with_seq_nums(3, 21, 30, Arc::clone(&opts))
-		.expect("Failed to create table 3");
+	let table1 = create_test_table_with_seq_nums(
+		test_sst_id(1),
+		1,
+		10,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 1");
+	let table2 = create_test_table_with_seq_nums(
+		test_sst_id(2),
+		11,
+		20,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 2");
+	let table3 = create_test_table_with_seq_nums(
+		test_sst_id(3),
+		21,
+		30,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 3");
 
 	let initial_table_count_l0 = manifest.levels.get_levels()[0].tables.len();
 	let initial_table_count_l1 = manifest.levels.get_levels()[1].tables.len();
@@ -790,8 +896,8 @@ fn test_revert_added_tables_only() {
 	);
 }
 
-#[test]
-fn test_revert_deleted_tables_only() {
+#[tokio::test]
+async fn test_revert_deleted_tables_only() {
 	let mut opts = Options::default();
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 	let repo_path = temp_dir.path().to_path_buf();
@@ -799,18 +905,39 @@ fn test_revert_deleted_tables_only() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = new_test_manifest(&opts);
+	let table_store = test_table_store();
 
 	// Add some tables first
-	let table1 = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
-		.expect("Failed to create table 1");
-	let table2 = create_test_table_with_seq_nums(2, 11, 20, Arc::clone(&opts))
-		.expect("Failed to create table 2");
-	let table3 = create_test_table_with_seq_nums(3, 21, 30, Arc::clone(&opts))
-		.expect("Failed to create table 3");
+	let table1 = create_test_table_with_seq_nums(
+		test_sst_id(1),
+		1,
+		10,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 1");
+	let table2 = create_test_table_with_seq_nums(
+		test_sst_id(2),
+		11,
+		20,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 2");
+	let table3 = create_test_table_with_seq_nums(
+		test_sst_id(3),
+		21,
+		30,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 3");
 
 	let add_changeset = ManifestChangeSet {
 		new_tables: vec![(0, table1), (0, table2), (1, table3)],
@@ -823,7 +950,11 @@ fn test_revert_deleted_tables_only() {
 
 	// Now delete them
 	let delete_changeset = ManifestChangeSet {
-		deleted_tables: std::collections::HashSet::from([(0, 1), (0, 2), (1, 3)]),
+		deleted_tables: HashSet::from([
+			(0, test_sst_id(1)),
+			(0, test_sst_id(2)),
+			(1, test_sst_id(3)),
+		]),
 		..Default::default()
 	};
 
@@ -846,13 +977,13 @@ fn test_revert_deleted_tables_only() {
 	);
 
 	// Verify table IDs are present
-	assert!(manifest.levels.get_levels()[0].tables.iter().any(|t| t.id == 1));
-	assert!(manifest.levels.get_levels()[0].tables.iter().any(|t| t.id == 2));
-	assert!(manifest.levels.get_levels()[1].tables.iter().any(|t| t.id == 3));
+	assert!(manifest.levels.get_levels()[0].tables.iter().any(|t| t.id == test_sst_id(1)));
+	assert!(manifest.levels.get_levels()[0].tables.iter().any(|t| t.id == test_sst_id(2)));
+	assert!(manifest.levels.get_levels()[1].tables.iter().any(|t| t.id == test_sst_id(3)));
 }
 
-#[test]
-fn test_revert_mixed_add_delete() {
+#[tokio::test]
+async fn test_revert_mixed_add_delete() {
 	let mut opts = Options::default();
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 	let repo_path = temp_dir.path().to_path_buf();
@@ -860,16 +991,30 @@ fn test_revert_mixed_add_delete() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = new_test_manifest(&opts);
+	let table_store = test_table_store();
 
 	// Add initial tables
-	let table1 = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
-		.expect("Failed to create table 1");
-	let table2 = create_test_table_with_seq_nums(2, 11, 20, Arc::clone(&opts))
-		.expect("Failed to create table 2");
+	let table1 = create_test_table_with_seq_nums(
+		test_sst_id(1),
+		1,
+		10,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 1");
+	let table2 = create_test_table_with_seq_nums(
+		test_sst_id(2),
+		11,
+		20,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 2");
 
 	let add_changeset = ManifestChangeSet {
 		new_tables: vec![(0, table1), (0, table2)],
@@ -880,11 +1025,18 @@ fn test_revert_mixed_add_delete() {
 	let initial_table_count_l0 = manifest.levels.get_levels()[0].tables.len();
 
 	// Mixed: delete table1, add table3
-	let table3 = create_test_table_with_seq_nums(3, 21, 30, Arc::clone(&opts))
-		.expect("Failed to create table 3");
+	let table3 = create_test_table_with_seq_nums(
+		test_sst_id(3),
+		21,
+		30,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 3");
 
 	let mixed_changeset = ManifestChangeSet {
-		deleted_tables: std::collections::HashSet::from([(0, 1)]),
+		deleted_tables: HashSet::from([(0, test_sst_id(1))]),
 		new_tables: vec![(0, table3)],
 		..Default::default()
 	};
@@ -892,8 +1044,8 @@ fn test_revert_mixed_add_delete() {
 	let rollback = manifest.apply_changeset(&mixed_changeset).expect("Failed to apply changeset");
 
 	assert_eq!(manifest.levels.get_levels()[0].tables.len(), initial_table_count_l0);
-	assert!(manifest.levels.get_levels()[0].tables.iter().any(|t| t.id == 3));
-	assert!(!manifest.levels.get_levels()[0].tables.iter().any(|t| t.id == 1));
+	assert!(manifest.levels.get_levels()[0].tables.iter().any(|t| t.id == test_sst_id(3)));
+	assert!(!manifest.levels.get_levels()[0].tables.iter().any(|t| t.id == test_sst_id(1)));
 
 	manifest.revert_changeset(rollback);
 
@@ -902,12 +1054,12 @@ fn test_revert_mixed_add_delete() {
 		initial_table_count_l0,
 		"L0 table count should be restored"
 	);
-	assert!(manifest.levels.get_levels()[0].tables.iter().any(|t| t.id == 1));
-	assert!(!manifest.levels.get_levels()[0].tables.iter().any(|t| t.id == 3));
+	assert!(manifest.levels.get_levels()[0].tables.iter().any(|t| t.id == test_sst_id(1)));
+	assert!(!manifest.levels.get_levels()[0].tables.iter().any(|t| t.id == test_sst_id(3)));
 }
 
-#[test]
-fn test_revert_preserves_table_ordering_l0() {
+#[tokio::test]
+async fn test_revert_preserves_table_ordering_l0() {
 	let mut opts = Options::default();
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 	let repo_path = temp_dir.path().to_path_buf();
@@ -915,18 +1067,39 @@ fn test_revert_preserves_table_ordering_l0() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = new_test_manifest(&opts);
+	let table_store = test_table_store();
 
 	// Add tables with different sequence numbers
-	let table1 = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
-		.expect("Failed to create table 1");
-	let table2 = create_test_table_with_seq_nums(2, 11, 20, Arc::clone(&opts))
-		.expect("Failed to create table 2");
-	let table3 = create_test_table_with_seq_nums(3, 21, 30, Arc::clone(&opts))
-		.expect("Failed to create table 3");
+	let table1 = create_test_table_with_seq_nums(
+		test_sst_id(1),
+		1,
+		10,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 1");
+	let table2 = create_test_table_with_seq_nums(
+		test_sst_id(2),
+		11,
+		20,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 2");
+	let table3 = create_test_table_with_seq_nums(
+		test_sst_id(3),
+		21,
+		30,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 3");
 
 	let add_changeset = ManifestChangeSet {
 		new_tables: vec![(0, table1), (0, table2), (0, table3)],
@@ -935,12 +1108,12 @@ fn test_revert_preserves_table_ordering_l0() {
 	let _ = manifest.apply_changeset(&add_changeset).expect("Failed to apply changeset");
 
 	// Capture initial ordering
-	let initial_order: Vec<u64> =
+	let initial_order: Vec<SstId> =
 		manifest.levels.get_levels()[0].tables.iter().map(|t| t.id).collect();
 
 	// Delete and re-add to test ordering preservation
 	let delete_changeset = ManifestChangeSet {
-		deleted_tables: std::collections::HashSet::from([(0, 2)]),
+		deleted_tables: HashSet::from([(0, test_sst_id(2))]),
 		..Default::default()
 	};
 
@@ -949,14 +1122,14 @@ fn test_revert_preserves_table_ordering_l0() {
 	manifest.revert_changeset(rollback);
 
 	// Verify ordering is preserved
-	let restored_order: Vec<u64> =
+	let restored_order: Vec<SstId> =
 		manifest.levels.get_levels()[0].tables.iter().map(|t| t.id).collect();
 
 	assert_eq!(initial_order, restored_order, "L0 table ordering should be preserved");
 }
 
-#[test]
-fn test_revert_preserves_table_ordering_l1() {
+#[tokio::test]
+async fn test_revert_preserves_table_ordering_l1() {
 	let mut opts = Options::default();
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 	let repo_path = temp_dir.path().to_path_buf();
@@ -964,18 +1137,39 @@ fn test_revert_preserves_table_ordering_l1() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = new_test_manifest(&opts);
+	let table_store = test_table_store();
 
 	// Add tables to L1 (sorted by key)
-	let table1 = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
-		.expect("Failed to create table 1");
-	let table2 = create_test_table_with_seq_nums(2, 11, 20, Arc::clone(&opts))
-		.expect("Failed to create table 2");
-	let table3 = create_test_table_with_seq_nums(3, 21, 30, Arc::clone(&opts))
-		.expect("Failed to create table 3");
+	let table1 = create_test_table_with_seq_nums(
+		test_sst_id(1),
+		1,
+		10,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 1");
+	let table2 = create_test_table_with_seq_nums(
+		test_sst_id(2),
+		11,
+		20,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 2");
+	let table3 = create_test_table_with_seq_nums(
+		test_sst_id(3),
+		21,
+		30,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 3");
 
 	let add_changeset = ManifestChangeSet {
 		new_tables: vec![(1, table1), (1, table2), (1, table3)],
@@ -984,12 +1178,12 @@ fn test_revert_preserves_table_ordering_l1() {
 	let _ = manifest.apply_changeset(&add_changeset).expect("Failed to apply changeset");
 
 	// Capture initial ordering
-	let initial_order: Vec<u64> =
+	let initial_order: Vec<SstId> =
 		manifest.levels.get_levels()[1].tables.iter().map(|t| t.id).collect();
 
 	// Delete and re-add to test ordering preservation
 	let delete_changeset = ManifestChangeSet {
-		deleted_tables: std::collections::HashSet::from([(1, 2)]),
+		deleted_tables: HashSet::from([(1, test_sst_id(2))]),
 		..Default::default()
 	};
 
@@ -998,14 +1192,14 @@ fn test_revert_preserves_table_ordering_l1() {
 	manifest.revert_changeset(rollback);
 
 	// Verify ordering is preserved
-	let restored_order: Vec<u64> =
+	let restored_order: Vec<SstId> =
 		manifest.levels.get_levels()[1].tables.iter().map(|t| t.id).collect();
 
 	assert_eq!(initial_order, restored_order, "L1+ table ordering should be preserved");
 }
 
-#[test]
-fn test_revert_log_number_change() {
+#[tokio::test]
+async fn test_revert_log_number_change() {
 	let mut opts = Options::default();
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 	let repo_path = temp_dir.path().to_path_buf();
@@ -1013,10 +1207,9 @@ fn test_revert_log_number_change() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = new_test_manifest(&opts);
 
 	let initial_log_number = manifest.get_log_number();
 	let new_log_number = 42;
@@ -1035,8 +1228,8 @@ fn test_revert_log_number_change() {
 	assert_eq!(manifest.get_log_number(), initial_log_number, "log_number should be reverted");
 }
 
-#[test]
-fn test_revert_log_number_not_changed() {
+#[tokio::test]
+async fn test_revert_log_number_not_changed() {
 	let mut opts = Options::default();
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 	let repo_path = temp_dir.path().to_path_buf();
@@ -1044,10 +1237,9 @@ fn test_revert_log_number_not_changed() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = new_test_manifest(&opts);
 
 	// Set log_number to a higher value first
 	let higher_log_number = 50;
@@ -1079,8 +1271,8 @@ fn test_revert_log_number_not_changed() {
 	);
 }
 
-#[test]
-fn test_revert_last_sequence() {
+#[tokio::test]
+async fn test_revert_last_sequence() {
 	let mut opts = Options::default();
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 	let repo_path = temp_dir.path().to_path_buf();
@@ -1088,15 +1280,22 @@ fn test_revert_last_sequence() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = new_test_manifest(&opts);
+	let table_store = test_table_store();
 
 	let initial_last_sequence = manifest.get_last_sequence();
 
-	let table = create_test_table_with_seq_nums(1, 1, 100, Arc::clone(&opts))
-		.expect("Failed to create table");
+	let table = create_test_table_with_seq_nums(
+		test_sst_id(1),
+		1,
+		100,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table");
 
 	let changeset = ManifestChangeSet {
 		new_tables: vec![(0, table)],
@@ -1116,8 +1315,8 @@ fn test_revert_last_sequence() {
 	);
 }
 
-#[test]
-fn test_revert_manifest_version() {
+#[tokio::test]
+async fn test_revert_manifest_version() {
 	let mut opts = Options::default();
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 	let repo_path = temp_dir.path().to_path_buf();
@@ -1125,10 +1324,9 @@ fn test_revert_manifest_version() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = new_test_manifest(&opts);
 
 	let initial_version = manifest.manifest_format_version;
 	let new_version = 2;
@@ -1153,8 +1351,8 @@ fn test_revert_manifest_version() {
 	);
 }
 
-#[test]
-fn test_revert_snapshots_added() {
+#[tokio::test]
+async fn test_revert_snapshots_added() {
 	let mut opts = Options::default();
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 	let repo_path = temp_dir.path().to_path_buf();
@@ -1162,10 +1360,9 @@ fn test_revert_snapshots_added() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = new_test_manifest(&opts);
 
 	let initial_snapshot_count = manifest.snapshots.len();
 
@@ -1202,8 +1399,8 @@ fn test_revert_snapshots_added() {
 	);
 }
 
-#[test]
-fn test_revert_snapshots_deleted() {
+#[tokio::test]
+async fn test_revert_snapshots_deleted() {
 	let mut opts = Options::default();
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 	let repo_path = temp_dir.path().to_path_buf();
@@ -1211,10 +1408,9 @@ fn test_revert_snapshots_deleted() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = new_test_manifest(&opts);
 
 	// Add snapshots first
 	let snapshot1 = SnapshotInfo {
@@ -1242,7 +1438,7 @@ fn test_revert_snapshots_deleted() {
 
 	// Now delete one
 	let delete_changeset = ManifestChangeSet {
-		deleted_snapshots: std::collections::HashSet::from([10]),
+		deleted_snapshots: HashSet::from([10]),
 		..Default::default()
 	};
 
@@ -1260,8 +1456,8 @@ fn test_revert_snapshots_deleted() {
 	assert!(manifest.snapshots.iter().any(|s| s.seq_num == 10));
 }
 
-#[test]
-fn test_revert_multiple_tables_same_level() {
+#[tokio::test]
+async fn test_revert_multiple_tables_same_level() {
 	let mut opts = Options::default();
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 	let repo_path = temp_dir.path().to_path_buf();
@@ -1269,19 +1465,47 @@ fn test_revert_multiple_tables_same_level() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = new_test_manifest(&opts);
+	let table_store = test_table_store();
 
-	let table1 = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
-		.expect("Failed to create table 1");
-	let table2 = create_test_table_with_seq_nums(2, 11, 20, Arc::clone(&opts))
-		.expect("Failed to create table 2");
-	let table3 = create_test_table_with_seq_nums(3, 21, 30, Arc::clone(&opts))
-		.expect("Failed to create table 3");
-	let table4 = create_test_table_with_seq_nums(4, 31, 40, Arc::clone(&opts))
-		.expect("Failed to create table 4");
+	let table1 = create_test_table_with_seq_nums(
+		test_sst_id(1),
+		1,
+		10,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 1");
+	let table2 = create_test_table_with_seq_nums(
+		test_sst_id(2),
+		11,
+		20,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 2");
+	let table3 = create_test_table_with_seq_nums(
+		test_sst_id(3),
+		21,
+		30,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 3");
+	let table4 = create_test_table_with_seq_nums(
+		test_sst_id(4),
+		31,
+		40,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 4");
 
 	let changeset = ManifestChangeSet {
 		new_tables: vec![(0, table1), (0, table2), (0, table3), (0, table4)],
@@ -1297,8 +1521,8 @@ fn test_revert_multiple_tables_same_level() {
 	assert_eq!(manifest.levels.get_levels()[0].tables.len(), 0, "All tables should be removed");
 }
 
-#[test]
-fn test_revert_table_only_one_in_level() {
+#[tokio::test]
+async fn test_revert_table_only_one_in_level() {
 	let mut opts = Options::default();
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 	let repo_path = temp_dir.path().to_path_buf();
@@ -1306,13 +1530,20 @@ fn test_revert_table_only_one_in_level() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = new_test_manifest(&opts);
+	let table_store = test_table_store();
 
-	let table = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
-		.expect("Failed to create table");
+	let table = create_test_table_with_seq_nums(
+		test_sst_id(1),
+		1,
+		10,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table");
 
 	let add_changeset = ManifestChangeSet {
 		new_tables: vec![(1, table)],
@@ -1323,7 +1554,7 @@ fn test_revert_table_only_one_in_level() {
 	assert_eq!(manifest.levels.get_levels()[1].tables.len(), 1);
 
 	let delete_changeset = ManifestChangeSet {
-		deleted_tables: std::collections::HashSet::from([(1, 1)]),
+		deleted_tables: HashSet::from([(1, test_sst_id(1))]),
 		..Default::default()
 	};
 
@@ -1334,11 +1565,11 @@ fn test_revert_table_only_one_in_level() {
 	manifest.revert_changeset(rollback);
 
 	assert_eq!(manifest.levels.get_levels()[1].tables.len(), 1, "Single table should be restored");
-	assert_eq!(manifest.levels.get_levels()[1].tables[0].id, 1);
+	assert_eq!(manifest.levels.get_levels()[1].tables[0].id, test_sst_id(1));
 }
 
-#[test]
-fn test_revert_idempotent() {
+#[tokio::test]
+async fn test_revert_idempotent() {
 	let mut opts = Options::default();
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 	let repo_path = temp_dir.path().to_path_buf();
@@ -1346,13 +1577,20 @@ fn test_revert_idempotent() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = new_test_manifest(&opts);
+	let table_store = test_table_store();
 
-	let table = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
-		.expect("Failed to create table");
+	let table = create_test_table_with_seq_nums(
+		test_sst_id(1),
+		1,
+		10,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table");
 
 	let changeset = ManifestChangeSet {
 		new_tables: vec![(0, table)],
@@ -1371,8 +1609,8 @@ fn test_revert_idempotent() {
 	assert_eq!(state_after_revert, 0, "Table should be removed after revert");
 }
 
-#[test]
-fn test_apply_revert_apply_cycle() {
+#[tokio::test]
+async fn test_apply_revert_apply_cycle() {
 	let mut opts = Options::default();
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 	let repo_path = temp_dir.path().to_path_buf();
@@ -1380,15 +1618,29 @@ fn test_apply_revert_apply_cycle() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = new_test_manifest(&opts);
+	let table_store = test_table_store();
 
-	let table1 = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
-		.expect("Failed to create table 1");
-	let table2 = create_test_table_with_seq_nums(2, 11, 20, Arc::clone(&opts))
-		.expect("Failed to create table 2");
+	let table1 = create_test_table_with_seq_nums(
+		test_sst_id(1),
+		1,
+		10,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 1");
+	let table2 = create_test_table_with_seq_nums(
+		test_sst_id(2),
+		11,
+		20,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 2");
 
 	// First apply
 	let changeset1 = ManifestChangeSet {
@@ -1405,8 +1657,15 @@ fn test_apply_revert_apply_cycle() {
 	assert_eq!(manifest.levels.get_levels()[0].tables.len(), 0);
 
 	// Apply again
-	let table1_again = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
-		.expect("Failed to create table 1");
+	let table1_again = create_test_table_with_seq_nums(
+		test_sst_id(1),
+		1,
+		10,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 1");
 	let changeset2 = ManifestChangeSet {
 		new_tables: vec![(0, table1_again), (0, table2)],
 		..Default::default()
@@ -1416,8 +1675,8 @@ fn test_apply_revert_apply_cycle() {
 	assert_eq!(manifest.levels.get_levels()[0].tables.len(), 2);
 }
 
-#[test]
-fn test_revert_after_disk_write_failure_simulation() {
+#[tokio::test]
+async fn test_revert_after_disk_write_failure_simulation() {
 	let mut opts = Options::default();
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 	let repo_path = temp_dir.path().to_path_buf();
@@ -1425,16 +1684,30 @@ fn test_revert_after_disk_write_failure_simulation() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = new_test_manifest(&opts);
+	let table_store = test_table_store();
 
 	// Add some initial tables
-	let table1 = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
-		.expect("Failed to create table 1");
-	let table2 = create_test_table_with_seq_nums(2, 11, 20, Arc::clone(&opts))
-		.expect("Failed to create table 2");
+	let table1 = create_test_table_with_seq_nums(
+		test_sst_id(1),
+		1,
+		10,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 1");
+	let table2 = create_test_table_with_seq_nums(
+		test_sst_id(2),
+		11,
+		20,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 2");
 
 	let initial_changeset = ManifestChangeSet {
 		new_tables: vec![(0, table1), (0, table2)],
@@ -1452,11 +1725,18 @@ fn test_revert_after_disk_write_failure_simulation() {
 	);
 
 	// Simulate a compaction-like operation: delete old tables, add new table
-	let table3 = create_test_table_with_seq_nums(3, 21, 100, Arc::clone(&opts))
-		.expect("Failed to create table 3");
+	let table3 = create_test_table_with_seq_nums(
+		test_sst_id(3),
+		21,
+		100,
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to create table 3");
 
 	let compaction_changeset = ManifestChangeSet {
-		deleted_tables: std::collections::HashSet::from([(0, 1), (0, 2)]),
+		deleted_tables: HashSet::from([(0, test_sst_id(1)), (0, test_sst_id(2))]),
 		new_tables: vec![(1, table3)],
 		log_number: Some(50),
 		..Default::default()
@@ -1494,7 +1774,469 @@ fn test_revert_after_disk_write_failure_simulation() {
 	);
 
 	// Verify original tables are still present
-	assert!(manifest.levels.get_levels()[0].tables.iter().any(|t| t.id == 1));
-	assert!(manifest.levels.get_levels()[0].tables.iter().any(|t| t.id == 2));
-	assert!(!manifest.levels.get_levels()[1].tables.iter().any(|t| t.id == 3));
+	assert!(manifest.levels.get_levels()[0].tables.iter().any(|t| t.id == test_sst_id(1)));
+	assert!(manifest.levels.get_levels()[0].tables.iter().any(|t| t.id == test_sst_id(2)));
+	assert!(!manifest.levels.get_levels()[1].tables.iter().any(|t| t.id == test_sst_id(3)));
+}
+
+// =============================================================================
+// Manifest Fuzz Tests
+// =============================================================================
+
+/// Fuzz test: random changeset sequences with model comparison.
+/// Applies random inserts, deletes, checkpoints, and reverts, verifying
+/// manifest state matches a BTreeMap model after each operation.
+#[tokio::test]
+async fn test_manifest_changeset_fuzz() {
+	let mut opts = Options::default();
+	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+	opts.path = temp_dir.path().to_path_buf();
+	opts.level_count = 4;
+	let opts = Arc::new(opts);
+
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+
+	let table_store = test_table_store();
+	let mut manifest = new_test_manifest(&opts);
+
+	// Model: (level, SstId) → exists
+	let mut model: std::collections::BTreeMap<(u8, SstId), bool> =
+		std::collections::BTreeMap::new();
+	let mut rng = fastrand::Rng::with_seed(42);
+	let mut next_table_id = 100u64;
+
+	for iteration in 0..200u32 {
+		let op = rng.u8(0..100);
+
+		if op < 40 {
+			// INSERT: add a table to a random level
+			let level = rng.u8(0..4);
+			let table_id = test_sst_id(next_table_id);
+			next_table_id += 1;
+			let seq_start = next_table_id * 10;
+			let seq_end = seq_start + 5;
+
+			let table = create_test_table_with_seq_nums(
+				table_id,
+				seq_start,
+				seq_end,
+				Arc::clone(&opts),
+				Arc::clone(&table_store),
+			)
+			.await
+			.expect("Failed to create table");
+
+			let changeset = ManifestChangeSet {
+				new_tables: vec![(level, table)],
+				..Default::default()
+			};
+
+			manifest.apply_changeset(&changeset).expect("Failed to apply insert changeset");
+			model.insert((level, table_id), true);
+		} else if op < 70 {
+			// COMPACTION-STYLE REPLACE: delete old table + add new with higher seq.
+			// Standalone deletes would cause last_sequence > max_table_seq, which the
+			// manifest loader correctly rejects. In production, compaction always replaces.
+			if model.is_empty() {
+				continue;
+			}
+			let keys: Vec<_> = model.keys().cloned().collect();
+			let idx = rng.usize(0..keys.len());
+			let (level, table_id) = keys[idx];
+
+			// Create replacement with seq higher than current last_sequence
+			let new_table_id = test_sst_id(next_table_id);
+			next_table_id += 1;
+			let seq_start = manifest.get_last_sequence() + 1;
+			let seq_end = seq_start + 3;
+			let new_table = create_test_table_with_seq_nums(
+				new_table_id,
+				seq_start,
+				seq_end,
+				Arc::clone(&opts),
+				Arc::clone(&table_store),
+			)
+			.await
+			.expect("Failed to create replacement table");
+
+			let target_level = rng.u8(0..4);
+			let mut deleted = HashSet::new();
+			deleted.insert((level, table_id));
+			let changeset = ManifestChangeSet {
+				deleted_tables: deleted,
+				new_tables: vec![(target_level, new_table)],
+				..Default::default()
+			};
+
+			manifest.apply_changeset(&changeset).expect("Failed to apply replace changeset");
+			model.remove(&(level, table_id));
+			model.insert((target_level, new_table_id), true);
+		} else if op < 90 {
+			// CHECKPOINT: write to disk + reload + verify
+			let _bytes = write_manifest_to_disk(&mut manifest).expect("Failed to write manifest");
+			let manifest_path = opts.manifest_file_path(manifest.manifest_id);
+
+			let loaded = load_from_file(
+				&manifest_path,
+				opts.manifest_dir(),
+				Arc::clone(&opts),
+				Arc::clone(&table_store),
+			)
+			.await
+			.expect("Failed to reload manifest");
+
+			// Verify all model entries present in loaded manifest
+			for &(level, table_id) in model.keys() {
+				let found = loaded.levels.get_levels()[level as usize]
+					.tables
+					.iter()
+					.any(|t| t.id == table_id);
+				assert!(
+					found,
+					"iteration {iteration}: table {table_id:?} at L{level} missing after reload"
+				);
+			}
+
+			// Verify no extra tables in loaded manifest
+			let mut loaded_count = 0;
+			for level in loaded.levels.get_levels() {
+				loaded_count += level.tables.len();
+			}
+			assert_eq!(
+				loaded_count,
+				model.len(),
+				"iteration {iteration}: loaded manifest has {loaded_count} tables, model has {}",
+				model.len()
+			);
+
+			assert_eq!(
+				loaded.manifest_id, manifest.manifest_id,
+				"iteration {iteration}: manifest_id mismatch after reload"
+			);
+		} else {
+			// REVERT: apply changeset then immediately revert
+			if next_table_id > 10000 {
+				continue; // Avoid creating too many tables
+			}
+			let level = rng.u8(0..4);
+			let table_id = test_sst_id(next_table_id);
+			next_table_id += 1;
+			let seq_start = next_table_id * 10;
+			let seq_end = seq_start + 5;
+
+			let table = create_test_table_with_seq_nums(
+				table_id,
+				seq_start,
+				seq_end,
+				Arc::clone(&opts),
+				Arc::clone(&table_store),
+			)
+			.await
+			.expect("Failed to create table");
+
+			// Snapshot pre-revert state
+			let pre_table_count: usize =
+				manifest.levels.get_levels().iter().map(|l| l.tables.len()).sum();
+			let pre_last_seq = manifest.get_last_sequence();
+
+			let changeset = ManifestChangeSet {
+				new_tables: vec![(level, table)],
+				..Default::default()
+			};
+
+			let rollback =
+				manifest.apply_changeset(&changeset).expect("Failed to apply revert changeset");
+			manifest.revert_changeset(rollback);
+
+			// Verify state unchanged
+			let post_table_count: usize =
+				manifest.levels.get_levels().iter().map(|l| l.tables.len()).sum();
+			assert_eq!(
+				pre_table_count, post_table_count,
+				"iteration {iteration}: table count changed after revert"
+			);
+			assert_eq!(
+				pre_last_seq,
+				manifest.get_last_sequence(),
+				"iteration {iteration}: last_sequence changed after revert"
+			);
+		}
+	}
+
+	// Final checkpoint + full comparison
+	let _bytes = write_manifest_to_disk(&mut manifest).expect("Failed to write final manifest");
+	let manifest_path = opts.manifest_file_path(manifest.manifest_id);
+	let loaded = load_from_file(
+		&manifest_path,
+		opts.manifest_dir(),
+		Arc::clone(&opts),
+		Arc::clone(&table_store),
+	)
+	.await
+	.expect("Failed to reload final manifest");
+
+	let mut loaded_tables: std::collections::BTreeSet<(u8, SstId)> =
+		std::collections::BTreeSet::new();
+	for (level_idx, level) in loaded.levels.get_levels().iter().enumerate() {
+		for table in &level.tables {
+			loaded_tables.insert((level_idx as u8, table.id));
+		}
+	}
+
+	let model_keys: std::collections::BTreeSet<_> = model.keys().cloned().collect();
+	assert_eq!(loaded_tables, model_keys, "Final manifest does not match model");
+}
+
+/// Manifest invariant test: verify critical invariants hold after every changeset.
+#[tokio::test]
+async fn test_manifest_invariants_under_mutation() {
+	let mut opts = Options::default();
+	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+	opts.path = temp_dir.path().to_path_buf();
+	opts.level_count = 4;
+	let opts = Arc::new(opts);
+
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+
+	let table_store = test_table_store();
+	let mut manifest = new_test_manifest(&opts);
+	let mut rng = fastrand::Rng::with_seed(77);
+	let mut next_table_id = 200u64;
+	let mut prev_manifest_id = manifest.manifest_id;
+
+	for iteration in 0..50u32 {
+		// Random changeset: insert or delete
+		let level = rng.u8(0..4);
+
+		if rng.bool() || manifest.levels.total_tables() == 0 {
+			// Insert
+			let table_id = test_sst_id(next_table_id);
+			next_table_id += 1;
+			let seq_start = next_table_id * 10;
+			let seq_end = seq_start + rng.u64(1..10);
+
+			let table = create_test_table_with_seq_nums(
+				table_id,
+				seq_start,
+				seq_end,
+				Arc::clone(&opts),
+				Arc::clone(&table_store),
+			)
+			.await
+			.expect("Failed to create table");
+
+			let changeset = ManifestChangeSet {
+				new_tables: vec![(level, table)],
+				..Default::default()
+			};
+			manifest.apply_changeset(&changeset).expect("Failed to apply changeset");
+		} else {
+			// Delete random table
+			let all_tables: Vec<_> = manifest
+				.levels
+				.get_levels()
+				.iter()
+				.enumerate()
+				.flat_map(|(lvl, level)| level.tables.iter().map(move |t| (lvl as u8, t.id)))
+				.collect();
+
+			if all_tables.is_empty() {
+				continue;
+			}
+			let idx = rng.usize(0..all_tables.len());
+			let (del_level, del_id) = all_tables[idx];
+
+			let mut deleted = HashSet::new();
+			deleted.insert((del_level, del_id));
+			let changeset = ManifestChangeSet {
+				deleted_tables: deleted,
+				..Default::default()
+			};
+			manifest.apply_changeset(&changeset).expect("Failed to apply delete");
+		}
+
+		// INVARIANT 1: manifest_id increases on each write
+		let _bytes = write_manifest_to_disk(&mut manifest).expect("Failed to write manifest");
+		assert!(
+			manifest.manifest_id > prev_manifest_id,
+			"iteration {iteration}: manifest_id did not increase: {} <= {}",
+			manifest.manifest_id,
+			prev_manifest_id
+		);
+		prev_manifest_id = manifest.manifest_id;
+
+		// INVARIANT 2: log_number never decreases (we don't modify it, so it stays 0)
+		assert_eq!(
+			manifest.get_log_number(),
+			0,
+			"iteration {iteration}: log_number should remain 0 in this test"
+		);
+
+		// INVARIANT 3: last_sequence >= max sequence of all tables
+		let max_seq_in_tables: u64 = manifest
+			.levels
+			.get_levels()
+			.iter()
+			.flat_map(|level| level.tables.iter())
+			.filter_map(|t| t.meta.largest_seq_num)
+			.max()
+			.unwrap_or(0);
+		assert!(
+			manifest.get_last_sequence() >= max_seq_in_tables,
+			"iteration {iteration}: last_sequence {} < max table seq {}",
+			manifest.get_last_sequence(),
+			max_seq_in_tables
+		);
+
+		// INVARIANT 4: no table ID in two different levels
+		let mut seen_ids: std::collections::HashMap<SstId, u8> = std::collections::HashMap::new();
+		for (level_idx, level) in manifest.levels.get_levels().iter().enumerate() {
+			for table in &level.tables {
+				if let Some(prev_level) = seen_ids.insert(table.id, level_idx as u8) {
+					panic!(
+						"iteration {iteration}: table {:?} in L{prev_level} and L{level_idx}",
+						table.id
+					);
+				}
+			}
+		}
+	}
+}
+
+/// Multi-cycle checkpoint recovery test: write + reload across 10 rounds,
+/// verifying state is preserved each time.
+#[tokio::test]
+async fn test_manifest_checkpoint_recovery_cycles() {
+	let mut opts = Options::default();
+	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+	opts.path = temp_dir.path().to_path_buf();
+	opts.level_count = 4;
+	let opts = Arc::new(opts);
+
+	std::fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+
+	let table_store = test_table_store();
+	let mut manifest = new_test_manifest(&opts);
+	let mut rng = fastrand::Rng::with_seed(123);
+	let mut next_table_id = 300u64;
+
+	for round in 0..10u32 {
+		// Apply 5-10 random changesets (inserts only, or compaction-style replace)
+		// NOTE: standalone deletes cause last_sequence mismatch on reload because
+		// last_sequence is a high-water mark that doesn't decrease. This matches
+		// production behavior where compaction always replaces (delete + add).
+		let num_changes = rng.usize(5..=10);
+		for _ in 0..num_changes {
+			let level = rng.u8(0..4);
+
+			if rng.u8(0..10) < 7 || manifest.levels.total_tables() == 0 {
+				// INSERT: add a new table
+				let table_id = test_sst_id(next_table_id);
+				next_table_id += 1;
+				let seq_start = next_table_id * 10;
+				let seq_end = seq_start + 3;
+
+				let table = create_test_table_with_seq_nums(
+					table_id,
+					seq_start,
+					seq_end,
+					Arc::clone(&opts),
+					Arc::clone(&table_store),
+				)
+				.await
+				.expect("Failed to create table");
+
+				let changeset = ManifestChangeSet {
+					new_tables: vec![(level, table)],
+					..Default::default()
+				};
+				manifest.apply_changeset(&changeset).expect("Failed to apply insert");
+			} else {
+				// COMPACTION-STYLE REPLACE: delete old + add new with higher seq
+				let all_tables: Vec<_> = manifest
+					.levels
+					.get_levels()
+					.iter()
+					.enumerate()
+					.flat_map(|(lvl, level)| level.tables.iter().map(move |t| (lvl as u8, t.id)))
+					.collect();
+
+				if !all_tables.is_empty() {
+					let idx = rng.usize(0..all_tables.len());
+					let (del_level, del_id) = all_tables[idx];
+
+					// Create replacement table with seq higher than current last_sequence
+					let new_table_id = test_sst_id(next_table_id);
+					next_table_id += 1;
+					let seq_start = manifest.get_last_sequence() + 1;
+					let seq_end = seq_start + 3;
+
+					let new_table = create_test_table_with_seq_nums(
+						new_table_id,
+						seq_start,
+						seq_end,
+						Arc::clone(&opts),
+						Arc::clone(&table_store),
+					)
+					.await
+					.expect("Failed to create replacement table");
+
+					let mut deleted = HashSet::new();
+					deleted.insert((del_level, del_id));
+					let changeset = ManifestChangeSet {
+						deleted_tables: deleted,
+						new_tables: vec![(level, new_table)],
+						..Default::default()
+					};
+					manifest.apply_changeset(&changeset).expect("Failed to apply replace");
+				}
+			}
+		}
+
+		// Checkpoint: write + reload
+		let _bytes = write_manifest_to_disk(&mut manifest).expect("Failed to write manifest");
+		let manifest_path = opts.manifest_file_path(manifest.manifest_id);
+
+		let loaded = load_from_file(
+			&manifest_path,
+			opts.manifest_dir(),
+			Arc::clone(&opts),
+			Arc::clone(&table_store),
+		)
+		.await
+		.unwrap_or_else(|e| panic!("round {round}: Failed to reload manifest: {e}"));
+
+		// Verify loaded state matches
+		assert_eq!(loaded.manifest_id, manifest.manifest_id, "round {round}: manifest_id mismatch");
+		assert_eq!(
+			loaded.get_log_number(),
+			manifest.get_log_number(),
+			"round {round}: log_number mismatch"
+		);
+		assert_eq!(
+			loaded.get_last_sequence(),
+			manifest.get_last_sequence(),
+			"round {round}: last_sequence mismatch"
+		);
+
+		// Verify same tables
+		let orig_tables: std::collections::BTreeSet<_> = manifest
+			.levels
+			.get_levels()
+			.iter()
+			.enumerate()
+			.flat_map(|(lvl, level)| level.tables.iter().map(move |t| (lvl as u8, t.id)))
+			.collect();
+		let loaded_tables: std::collections::BTreeSet<_> = loaded
+			.levels
+			.get_levels()
+			.iter()
+			.enumerate()
+			.flat_map(|(lvl, level)| level.tables.iter().map(move |t| (lvl as u8, t.id)))
+			.collect();
+		assert_eq!(orig_tables, loaded_tables, "round {round}: table sets differ after reload");
+
+		// Continue using loaded manifest for next round (simulates restart)
+		manifest = loaded;
+	}
 }

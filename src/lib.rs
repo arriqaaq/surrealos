@@ -1,21 +1,24 @@
 mod batch;
+pub mod branch;
 mod cache;
-mod checkpoint;
 mod clock;
+mod cloud_store;
 mod commit;
 mod compaction;
 mod comparator;
 mod compression;
+mod epoch;
 mod error;
+mod gc;
 mod iter;
 mod levels;
 mod lockfile;
 mod lsm;
+mod manifest;
 mod memtable;
+mod paths;
 mod snapshot;
 mod sstable;
-mod stall;
-mod task;
 mod vfs;
 mod wal;
 
@@ -26,6 +29,7 @@ use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator, TimestampComparator};
 use sstable::bloom::LevelDBBloomFilter;
@@ -187,15 +191,44 @@ pub struct Options {
 	/// Default: 10.0
 	pub level_multiplier: f64,
 
-	/// Number of immutable memtables that triggers write stall.
-	/// When immutable memtable count >= this threshold, writes block until flushes complete.
-	/// Default: 2
-	pub memtable_stall_threshold: usize,
-	/// Number of L0 files that triggers write stall.
-	/// When L0 file count >= this threshold, writes block until compactions complete.
-	/// Should be >= level0_max_files (compaction trigger).
-	/// Default: 12 (3x level0_max_files)
-	pub l0_stall_threshold: usize,
+	/// Number of beats per compaction bar.
+	/// Each commit advances one beat. A bar is one full compaction cycle.
+	/// Levels alternate between half-bars: odd targets in first half, even in second.
+	/// Default: 32
+	pub compaction_beats_per_bar: u64,
+
+	// Object store configuration
+	/// Object store for SSTs and manifest. Default: in-memory store.
+	pub object_store: Arc<dyn object_store::ObjectStore>,
+	/// Root path prefix in the object store for all data.
+	/// Default: empty (root of the store)
+	pub object_store_root: String,
+	/// Max SST size for compaction output splits.
+	/// Default: 64MB
+	pub max_sst_size: usize,
+
+	// Fencing configuration
+	/// Identity of the leader replica for distributed coordination.
+	/// Set by the external coordination layer (e.g., Raft term + replica ID).
+	/// 0 means single-node mode (no distributed coordination).
+	/// Default: 0
+	pub leader_id: u128,
+	/// Timeout for manifest update operations during fencing init.
+	/// Default: 30 seconds
+	pub manifest_update_timeout: Duration,
+
+	// Local SST cache
+	/// When true, SST files are kept on local disk after upload to object store.
+	/// Reads prefer local files, falling back to object store on miss.
+	/// Default: false
+	pub local_sst_cache: bool,
+
+	// Branching configuration
+	/// Branch name for this store instance.
+	/// When set, manifests are stored under `branches/{name}/` prefix.
+	/// SSTs remain in the shared pool (ULIDs are globally unique).
+	/// Default: None (root/main branch)
+	pub branch_name: Option<String>,
 }
 
 impl Default for Options {
@@ -228,8 +261,14 @@ impl Default for Options {
 			level0_max_files: 4,
 			max_bytes_for_level: 256 * 1024 * 1024, // 256MB
 			level_multiplier: 10.0,
-			memtable_stall_threshold: 2,
-			l0_stall_threshold: 12,
+			compaction_beats_per_bar: crate::compaction::DEFAULT_BEATS_PER_BAR,
+			object_store: Arc::new(object_store::memory::InMemory::new()),
+			object_store_root: String::new(),
+			max_sst_size: 64 * 1024 * 1024, // 64MB
+			leader_id: 0,
+			manifest_update_timeout: Duration::from_secs(30),
+			local_sst_cache: true,
+			branch_name: None,
 		}
 	}
 }
@@ -268,7 +307,7 @@ impl Options {
 	/// # Example
 	///
 	/// ```no_run
-	/// use surrealkv::Options;
+	/// use surrealos::Options;
 	///
 	/// let opts = Options::new().without_compression();
 	/// ```
@@ -284,7 +323,7 @@ impl Options {
 	/// # Example
 	///
 	/// ```no_run
-	/// use surrealkv::{Options, CompressionType};
+	/// use surrealos::{Options, CompressionType};
 	///
 	/// let opts = Options::new()
 	///     .with_compression_per_level(vec![
@@ -305,7 +344,7 @@ impl Options {
 	/// # Example
 	///
 	/// ```no_run
-	/// use surrealkv::Options;
+	/// use surrealos::Options;
 	///
 	/// let opts = Options::new().with_l0_no_compression();
 	/// ```
@@ -385,15 +424,48 @@ impl Options {
 		self
 	}
 
-	/// Sets the number of immutable memtables that triggers write stall.
-	pub const fn with_memtable_stall_threshold(mut self, value: usize) -> Self {
-		self.memtable_stall_threshold = value;
+	/// Sets the object store for SSTs and manifest storage.
+	pub fn with_object_store(mut self, store: Arc<dyn object_store::ObjectStore>) -> Self {
+		self.object_store = store;
 		self
 	}
 
-	/// Sets the number of L0 files that triggers write stall.
-	pub const fn with_l0_stall_threshold(mut self, value: usize) -> Self {
-		self.l0_stall_threshold = value;
+	/// Sets the root path prefix in the object store.
+	pub fn with_object_store_root(mut self, root: impl Into<String>) -> Self {
+		self.object_store_root = root.into();
+		self
+	}
+
+	/// Sets the max SST size for compaction output splits.
+	pub const fn with_max_sst_size(mut self, size: usize) -> Self {
+		self.max_sst_size = size;
+		self
+	}
+
+	/// Sets the leader ID for distributed coordination.
+	/// 0 means single-node mode (no fencing).
+	pub const fn with_leader_id(mut self, id: u128) -> Self {
+		self.leader_id = id;
+		self
+	}
+
+	/// Sets the timeout for manifest update operations during fencing init.
+	pub const fn with_manifest_update_timeout(mut self, timeout: Duration) -> Self {
+		self.manifest_update_timeout = timeout;
+		self
+	}
+
+	/// When true, SST files are kept on local disk after upload to object store.
+	/// Reads prefer local files, falling back to object store on miss.
+	pub const fn with_local_sst_cache(mut self, value: bool) -> Self {
+		self.local_sst_cache = value;
+		self
+	}
+
+	/// Sets the branch name for this store instance.
+	/// When set, manifests are stored under a branch-scoped prefix.
+	pub fn with_branch(mut self, name: impl Into<String>) -> Self {
+		self.branch_name = Some(name.into());
 		self
 	}
 
@@ -404,9 +476,9 @@ impl Options {
 	}
 
 	/// Returns the path for an `SSTable` file with the given ID
-	/// Format: {path}/sstables/{id:020}.sst
-	pub(crate) fn sstable_file_path(&self, id: u64) -> PathBuf {
-		self.sstable_dir().join(format!("{id:020}.sst"))
+	/// Format: {path}/sstables/{id}.sst
+	pub(crate) fn sstable_file_path(&self, id: crate::sstable::SstId) -> PathBuf {
+		self.sstable_dir().join(format!("{id}.sst"))
 	}
 
 	/// Returns the directory path for WAL files
@@ -416,7 +488,7 @@ impl Options {
 
 	/// Returns the directory path for `SSTable` files
 	pub(crate) fn sstable_dir(&self) -> PathBuf {
-		self.path.join("sstables")
+		self.path.join("sst")
 	}
 
 	/// Returns the directory path for manifest files
@@ -431,19 +503,6 @@ impl Options {
 		// Validate level count is reasonable
 		if self.level_count == 0 {
 			return Err(Error::InvalidArgument("Level count must be at least 1".to_string()));
-		}
-
-		// Validate write stall configuration
-		if self.memtable_stall_threshold < 2 {
-			return Err(Error::InvalidArgument(
-				"memtable_stall_threshold must be >= 2".to_string(),
-			));
-		}
-		if self.l0_stall_threshold < self.level0_max_files {
-			return Err(Error::InvalidArgument(format!(
-				"l0_stall_threshold ({}) must be >= level0_max_files ({})",
-				self.l0_stall_threshold, self.level0_max_files
-			)));
 		}
 
 		Ok(())
@@ -555,13 +614,11 @@ fn trailer_to_kind(trailer: u64) -> InternalKeyKind {
 	let kind_byte = trailer as u8;
 	match kind_byte {
 		0 => InternalKeyKind::Delete,
-		1 => InternalKeyKind::SoftDelete,
-		2 => InternalKeyKind::Set,
-		3 => InternalKeyKind::Merge,
-		4 => InternalKeyKind::LogData,
-		5 => InternalKeyKind::RangeDelete,
-		6 => InternalKeyKind::Replace,
-		7 => InternalKeyKind::Separator,
+		1 => InternalKeyKind::Set,
+		2 => InternalKeyKind::Merge,
+		3 => InternalKeyKind::LogData,
+		4 => InternalKeyKind::RangeDelete,
+		5 => InternalKeyKind::Separator,
 		24 => InternalKeyKind::Max,
 		_ => InternalKeyKind::Invalid,
 	}
@@ -577,35 +634,18 @@ fn trailer_to_seq_num(trailer: u64) -> u64 {
 /// Checks if a key kind represents a tombstone (delete operation)
 #[inline(always)]
 fn is_delete_kind(kind: InternalKeyKind) -> bool {
-	matches!(
-		kind,
-		InternalKeyKind::Delete | InternalKeyKind::SoftDelete | InternalKeyKind::RangeDelete
-	)
-}
-
-/// Checks if a key kind represents a hard delete (delete operation)
-#[inline(always)]
-fn is_hard_delete_marker(kind: InternalKeyKind) -> bool {
 	matches!(kind, InternalKeyKind::Delete | InternalKeyKind::RangeDelete)
-}
-
-/// Checks if a key kind represents a Replace operation
-#[inline(always)]
-fn is_replace_kind(kind: InternalKeyKind) -> bool {
-	matches!(kind, InternalKeyKind::Replace)
 }
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum InternalKeyKind {
 	Delete = 0,
-	SoftDelete = 1,
-	Set = 2,
-	Merge = 3,
-	LogData = 4,
-	RangeDelete = 5,
-	Replace = 6, // Replaces previous key when versioning is enabled
-	Separator = 7,
+	Set = 1,
+	Merge = 2,
+	LogData = 3,
+	RangeDelete = 4,
+	Separator = 5,
 	Max = 24, // Leaving space for other kinds
 	Invalid = 191,
 }
@@ -694,14 +734,6 @@ impl InternalKey {
 	#[inline]
 	pub(crate) fn is_tombstone(&self) -> bool {
 		is_delete_kind(self.kind())
-	}
-
-	pub(crate) fn is_hard_delete_marker(&self) -> bool {
-		is_hard_delete_marker(self.kind())
-	}
-
-	pub(crate) fn is_replace(&self) -> bool {
-		is_replace_kind(self.kind())
 	}
 
 	/// Compares this key with another key using timestamp-based ordering
@@ -799,16 +831,6 @@ impl<'a> InternalKeyRef<'a> {
 		is_delete_kind(self.kind())
 	}
 
-	#[inline]
-	pub fn is_hard_delete_marker(&self) -> bool {
-		is_hard_delete_marker(self.kind())
-	}
-
-	#[inline]
-	pub fn is_replace(&self) -> bool {
-		is_replace_kind(self.kind())
-	}
-
 	pub(crate) fn to_owned(self) -> InternalKey {
 		InternalKey::decode(self.encoded)
 	}
@@ -852,22 +874,23 @@ impl std::fmt::Debug for InternalKeyRef<'_> {
 ///     iter.next()?;
 /// }
 /// ```
-pub trait LSMIterator {
+#[async_trait::async_trait]
+pub trait LSMIterator: Send {
 	/// Seek to first key >= target. Returns Ok(true) if valid.
 	/// Target is an encoded internal key. Use `encode_seek_key()` to encode a user key.
-	fn seek(&mut self, target: &[u8]) -> Result<bool>;
+	async fn seek(&mut self, target: &[u8]) -> Result<bool>;
 
 	/// Seek to first entry. Returns Ok(true) if valid.
-	fn seek_first(&mut self) -> Result<bool>;
+	async fn seek_first(&mut self) -> Result<bool>;
 
 	/// Seek to last entry. Returns Ok(true) if valid.
-	fn seek_last(&mut self) -> Result<bool>;
+	async fn seek_last(&mut self) -> Result<bool>;
 
 	/// Move to next entry. Returns Ok(true) if valid.
-	fn next(&mut self) -> Result<bool>;
+	async fn next(&mut self) -> Result<bool>;
 
 	/// Move to previous entry. Returns Ok(true) if valid.
-	fn prev(&mut self) -> Result<bool>;
+	async fn prev(&mut self) -> Result<bool>;
 
 	/// Check if positioned on valid entry.
 	fn valid(&self) -> bool;

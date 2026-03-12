@@ -1,40 +1,44 @@
-# SurrealKV
+# SurrealOS
 
-[![License](https://img.shields.io/badge/license-Apache_License_2.0-00bfff.svg?style=flat-square)](https://github.com/surrealdb/surrealkv)
+[![License](https://img.shields.io/badge/license-Apache_License_2.0-00bfff.svg?style=flat-square)](https://github.com/surrealdb/surrealos)
 
-SurrealKV is a versioned, embedded key-value store built on an LSM (Log-Structured Merge) tree architecture, with support for time-travel queries.
+SurrealOS is a versioned, embedded key-value store built on an LSM (Log-Structured Merge) tree architecture, with support for time-travel queries.
 
-It is designed specifically for use within SurrealDB, with the goal of reducing dependency on external storage engine (RocksDB). This approach allows the storage layer to evolve in alignment with SurrealDB’s requirements and access patterns.
+It is designed specifically for use within SurrealDB, with the goal of reducing dependency on external storage engines (RocksDB). This approach allows the storage layer to evolve in alignment with SurrealDB's requirements and access patterns.
 
 ## Features
 
-- **ACID Compliance**: Full support for Atomicity, Consistency, Isolation, and Durability
 - **Snapshot Isolation**: MVCC support with non-blocking concurrent reads and writes
 - **Durability Levels**: Immediate and Eventual durability modes
 - **Time-Travel Queries**: Built-in versioning with point-in-time reads and historical queries
-- **Checkpoint and Restore**: Create consistent snapshots for backup and recovery
-- **Value Log (Wisckey)**: Ability to store large values separately, with garbage collection
+- **Checkpoint and Restore**: Create consistent snapshots for backup and recovery, including cloud checkpoints
+- **Object Store Support**: Cloud-native storage via S3, GCS, Azure, or local filesystem
+- **Distributed Fencing**: Writer/compactor epoch-based fencing for multi-node deployments
+- **Beat/Bar Compaction**: TigerBeetle-inspired synchronous compaction pacing for predictable latency
 
 ## Quick Start
 
 ```rust
-use surrealkv::{Tree, TreeBuilder};
+use surrealos::StoreBuilder;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create a new LSM tree using TreeBuilder
-    let tree = TreeBuilder::new()
+    // Create a new store using StoreBuilder
+    let store = StoreBuilder::new()
         .with_path("path/to/db".into())
-        .build()?;
+        .build()
+        .await?;
 
-    // Start a read-write transaction
-    let mut txn = tree.begin()?;
+    // Write a key-value pair
+    store.set(b"hello", b"world").await?;
 
-    // Set some key-value pairs
-    txn.set(b"hello", b"world")?;
+    // Read a key
+    if let Some(value) = store.get(b"hello").await? {
+        println!("Value: {:?}", value);
+    }
 
-    // Commit the transaction (async)
-    txn.commit().await?;
+    // Close the store
+    store.close().await?;
 
     Ok(())
 }
@@ -42,62 +46,77 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Configuration
 
-SurrealKV can be configured through various options when creating a new LSM tree:
+SurrealOS can be configured through various options when creating a new store:
 
 ### Basic Configuration
 
 ```rust
-use surrealkv::TreeBuilder;
+use surrealos::StoreBuilder;
 
-let tree = TreeBuilder::new()
-    .with_path("path/to/db".into())           // Database directory path
-    .with_max_memtable_size(100 * 1024 * 1024) // 100MB memtable size
-    .with_block_size(4096)                    // 4KB block size
-    .with_level_count(7)                      // Number of levels in LSM tree
-    .build()?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let store = StoreBuilder::new()
+        .with_path("path/to/db".into())           // Database directory path
+        .with_max_memtable_size(100 * 1024 * 1024) // 100MB memtable size (default)
+        .with_block_size(64 * 1024)                // 64KB block size (default)
+        .with_level_count(6)                       // Number of levels in LSM tree (default)
+        .with_block_cache_capacity(1 << 20)        // 1MB block cache (default)
+        .build()
+        .await?;
+
+    Ok(())
+}
 ```
 
 **Options:**
 - `with_path()` - Database directory where SSTables and WAL files are stored
-- `with_max_memtable_size()` - Size threshold for memtable before flushing to SSTable
-- `with_block_size()` - Size of data blocks in SSTables (affects read performance)
-- `with_level_count()` - Number of levels in the LSM tree structure
+- `with_max_memtable_size()` - Size threshold for memtable before flushing to SSTable (default: 100MB)
+- `with_block_size()` - Size of data blocks in SSTables (default: 64KB)
+- `with_level_count()` - Number of levels in the LSM tree structure (default: 6)
+- `with_block_cache_capacity()` - Unified block cache capacity in bytes (default: 1MB)
+- `with_index_partition_size()` - Partitioned index block size (default: 16KB)
 
 ### Compression Configuration
 
-SurrealKV supports per-level compression for SSTable data blocks, allowing different compression algorithms for different LSM levels. By default, no compression is used.
+SurrealOS supports per-level compression for SSTable data blocks, allowing different compression algorithms for different LSM levels. By default, no compression is used.
 
 ```rust
-use surrealkv::{CompressionType, Options, TreeBuilder};
+use surrealos::{CompressionType, Options, StoreBuilder};
 
-// Default: No compression (for maximum write performance)
-let tree = TreeBuilder::new()
-    .with_path("path/to/db".into())
-    .build()?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Default: No compression (for maximum write performance)
+    let store = StoreBuilder::new()
+        .with_path("path/to/db".into())
+        .build()
+        .await?;
 
-// Explicitly disable compression (same as default)
-let opts = Options::new()
-    .with_path("path/to/db".into())
-    .without_compression();
+    // Explicitly disable compression (same as default)
+    let opts = Options::new()
+        .with_path("path/to/db".into())
+        .without_compression();
 
-let tree = TreeBuilder::with_options(opts).build()?;
+    let store = StoreBuilder::with_options(opts).build().await?;
 
-// Per-level compression configuration
-let opts = Options::new()
-    .with_path("path/to/db".into())
-    .with_compression_per_level(vec![
-        CompressionType::None,        // L0: No compression for speed
-        CompressionType::SnappyCompression, // L1+: Snappy compression
-    ]);
+    // Per-level compression configuration
+    let opts = Options::new()
+        .with_path("path/to/db".into())
+        .with_compression_per_level(vec![
+            CompressionType::None,               // L0: No compression for speed
+            CompressionType::SnappyCompression,  // L1+: Snappy compression
+        ]);
 
-let tree = TreeBuilder::with_options(opts).build()?;
+    let store = StoreBuilder::with_options(opts).build().await?;
 
-// Convenience: No compression on L0, Snappy on other levels
-let opts = Options::new()
-    .with_path("path/to/db".into())
-    .with_l0_no_compression();
+    // Convenience: No compression on L0, Snappy on other levels
+    let opts = Options::new()
+        .with_path("path/to/db".into())
+        .with_l0_no_compression();
 
-let tree = TreeBuilder::with_options(opts).build()?;
+    let store = StoreBuilder::with_options(opts).build().await?;
+
+    Ok(())
+}
 ```
 
 **Options:**
@@ -109,164 +128,213 @@ let tree = TreeBuilder::with_options(opts).build()?;
 - `CompressionType::None` - No compression (fastest writes, largest files)
 - `CompressionType::SnappyCompression` - Snappy compression (good balance of speed and compression ratio)
 
-### Value Log Configuration
-
-The Value Log (VLog) separates large values from the LSM tree for more efficient storage and compaction.
-
-```rust
-use surrealkv::{TreeBuilder, VLogChecksumLevel};
-
-let tree = TreeBuilder::new()
-    .with_path("path/to/db".into())
-    .with_enable_vlog(true)                     // Enable VLog
-    .with_vlog_value_threshold(1024)            // Values > 1KB go to VLog
-    .with_vlog_max_file_size(256 * 1024 * 1024) // 256MB VLog file size
-    .with_vlog_checksum_verification(VLogChecksumLevel::Full)
-    .build()?;
-```
-
-**Options:**
-- `with_enable_vlog()` - Enable/disable Value Log for large value storage
-- `with_vlog_value_threshold()` - Size threshold in bytes; values larger than this are stored in VLog (default: 1KB)
-- `with_vlog_max_file_size()` - Maximum size of VLog files before rotation (default: 256MB)
-- `with_vlog_checksum_verification()` - Checksum verification level (`Disabled` or `Full`)
-
-
 ### Versioning Configuration
 
 Enable time-travel queries to read historical versions of your data:
 
 ```rust
-use surrealkv::{Options, TreeBuilder};
+use surrealos::{Options, StoreBuilder};
 
-let opts = Options::new()
-    .with_path("path/to/db".into())
-    .with_versioning(true, 0);  // Enable versioning, retention_ns = 0 means no limit
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let opts = Options::new()
+        .with_path("path/to/db".into())
+        .with_versioning(true, 0);  // Enable versioning, retention_ns = 0 means no limit
 
-let tree = TreeBuilder::with_options(opts).build()?;
+    let store = StoreBuilder::with_options(opts).build().await?;
+
+    Ok(())
+}
 ```
 
-**Note:** Versioning requires VLog to be enabled. When you call `with_versioning(true, retention_ns)`, VLog is automatically enabled and configured appropriately.
+### Object Store Configuration
 
-**Important:** When versioning is enabled without the B+tree index, timestamps inserted "back in time" (earlier than existing timestamps) will not be read correctly. This is because the LSM tree orders entries by user key ascending and sequence number descending, not by timestamp.
+SurrealOS can store SSTables and manifests in cloud object stores:
 
-If you need to insert historical data with earlier timestamps, enable the B+tree versioned index with `with_versioned_index(true)`. The B+tree allows in-place updates and correctly handles out-of-order timestamp inserts.
+```rust
+use surrealos::{Options, StoreBuilder};
+use std::sync::Arc;
 
-## Transaction Operations
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let opts = Options::new()
+        .with_path("path/to/local/cache".into())
+        .with_object_store(Arc::new(
+            object_store::aws::AmazonS3Builder::from_env()
+                .with_bucket_name("my-bucket")
+                .build()?
+        ))
+        .with_object_store_root("my-db".into());
+
+    let store = StoreBuilder::with_options(opts).build().await?;
+
+    Ok(())
+}
+```
+
+**Options:**
+- `with_object_store()` - Set the object store backend (default: in-memory)
+- `with_object_store_root()` - Root path prefix in the object store
+- `with_local_sst_cache()` - Cache SSTs locally after upload (default: true)
+- `with_max_sst_size()` - Max SST size for compaction output splits (default: 64MB)
+
+### Distributed Fencing Configuration
+
+For multi-node deployments, enable writer fencing to prevent split-brain:
+
+```rust
+use surrealos::{Options, StoreBuilder};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let opts = Options::new()
+        .with_path("path/to/db".into())
+        .with_leader_id(1)  // Non-zero enables fencing
+        .with_manifest_update_timeout(Duration::from_secs(30));
+
+    let store = StoreBuilder::with_options(opts).build().await?;
+
+    Ok(())
+}
+```
+
+## Store Operations
 
 ### Basic Operations
 
 ```rust
-use surrealkv::TreeBuilder;
+use surrealos::StoreBuilder;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let tree = TreeBuilder::new()
+    let store = StoreBuilder::new()
         .with_path("path/to/db".into())
-        .build()?;
+        .build()
+        .await?;
 
-    // Write Transaction
-    {
-        let mut txn = tree.begin()?;
-        
-        // Set multiple key-value pairs
-        txn.set(b"foo1", b"bar1")?;
-        txn.set(b"foo2", b"bar2")?;
-        
-        // Commit changes (async)
-        txn.commit().await?;
+    // Write operations
+    store.set(b"foo1", b"bar1").await?;
+    store.set(b"foo2", b"bar2").await?;
+
+    // Read a key
+    if let Some(value) = store.get(b"foo1").await? {
+        println!("Value: {:?}", value);
     }
 
-    // Read Transaction
-    {
-        let txn = tree.begin()?;
-        
-        if let Some(value) = txn.get(b"foo1")? {
-            println!("Value: {:?}", value);
-        }
+    // Delete a key
+    store.delete(b"foo1").await?;
+
+    Ok(())
+}
+```
+
+### Batch Operations
+
+Use batches to apply multiple writes atomically:
+
+```rust
+use surrealos::StoreBuilder;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let store = StoreBuilder::new()
+        .with_path("path/to/db".into())
+        .build()
+        .await?;
+
+    // Create and populate a batch
+    let mut batch = store.new_batch();
+    batch.set(b"key1", b"value1")?;
+    batch.set(b"key2", b"value2")?;
+    batch.delete(b"key3")?;
+
+    // Apply atomically (sync = false for eventual durability)
+    store.apply(batch, false).await?;
+
+    // Apply with immediate durability (fsync before returning)
+    let mut batch = store.new_batch();
+    batch.set(b"key4", b"value4")?;
+    store.apply(batch, true).await?;
+
+    Ok(())
+}
+```
+
+### Range Operations
+
+Range operations use a cursor-based iterator API via snapshots:
+
+```rust
+use surrealos::{StoreBuilder, LSMIterator};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let store = StoreBuilder::new()
+        .with_path("path/to/db".into())
+        .build()
+        .await?;
+
+    let snapshot = store.new_snapshot();
+
+    // Range scan (inclusive lower, exclusive upper)
+    let mut iter = snapshot.range(Some(b"key1".as_ref()), Some(b"key5".as_ref()))?;
+    iter.seek_first().await?;
+    while iter.valid() {
+        let key_ref = iter.key();
+        let user_key = key_ref.user_key();
+        let value = iter.value()?;
+        println!("{:?} = {:?}", user_key, value);
+        iter.next().await?;
+    }
+
+    // Backward iteration
+    let mut iter = snapshot.range(Some(b"key1".as_ref()), Some(b"key5".as_ref()))?;
+    iter.seek_last().await?;
+    while iter.valid() {
+        let key_ref = iter.key();
+        let value = iter.value()?;
+        println!("{:?} = {:?}", key_ref.user_key(), value);
+        iter.prev().await?;
     }
 
     Ok(())
 }
 ```
 
-**Note:** The transaction API accepts flexible key and value types through the `IntoBytes` trait. You can use `&[u8]`, `&str`, `String`, `Vec<u8>`, or `Bytes` for both keys and values.
-
-### Transaction Modes
-
-SurrealKV supports three transaction modes for different use cases:
-
-```rust
-use surrealkv::Mode;
-
-// Read-write transaction (default)
-let mut txn = tree.begin()?;
-
-// Read-only transaction - prevents any writes
-let txn = tree.begin_with_mode(Mode::ReadOnly)?;
-
-// Write-only transaction - optimized for writes, no reads allowed
-let mut txn = tree.begin_with_mode(Mode::WriteOnly)?;
-```
-
-### Range Operations
-
-Range operations use a cursor-based iterator API for efficient iteration over key ranges:
-
-```rust
-let txn = tree.begin()?;
-
-// Range scan between keys (inclusive start, exclusive end)
-let mut iter = txn.range(b"key1", b"key5")?;
-iter.seek_first()?;
-while iter.valid() {
-    let key = iter.key();
-    let value = iter.value()?;
-    println!("{:?} = {:?}", key, value);
-    iter.next()?;
-}
-
-// Backward iteration
-let mut iter = txn.range(b"key1", b"key5")?;
-iter.seek_last()?;
-while iter.valid() {
-    let key = iter.key();
-    let value = iter.value()?;
-    println!("{:?} = {:?}", key, value);
-    iter.prev()?;
-}
-
-// Delete a key
-let mut txn = tree.begin()?;
-txn.delete(b"key1")?;
-txn.commit().await?;
-```
-
-**Note:** Range iterators support both forward (`next()`) and backward (`prev()`) iteration using the cursor-based API.
-
 ### Durability Levels
 
-Control the durability guarantees for your transactions:
+Control durability guarantees via the `sync` parameter on `Store::apply()`:
 
 ```rust
-use surrealkv::Durability;
+use surrealos::StoreBuilder;
 
-let mut txn = tree.begin()?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let store = StoreBuilder::new()
+        .with_path("path/to/db".into())
+        .build()
+        .await?;
 
-// Eventual durability (default) - faster, data written to OS buffer
-txn.set_durability(Durability::Eventual);
+    let mut batch = store.new_batch();
+    batch.set(b"key", b"value")?;
 
-// Immediate durability - slower, fsync before commit returns
-txn.set_durability(Durability::Immediate);
+    // Eventual durability (sync = false) - faster, data written to OS buffer
+    store.apply(batch, false).await?;
 
-txn.set(b"key", b"value")?;
-txn.commit().await?;
+    let mut batch = store.new_batch();
+    batch.set(b"key2", b"value2")?;
+
+    // Immediate durability (sync = true) - slower, fsync before returning
+    store.apply(batch, true).await?;
+
+    Ok(())
+}
 ```
 
 **Durability Levels:**
-- `Eventual`: Commits are guaranteed to be persistent eventually. Data is written to the kernel buffer but not fsynced before returning from `commit()`. This is the default and provides the best performance.
-- `Immediate`: Commits are guaranteed to be persistent as soon as `commit()` returns. Data is fsynced to disk before returning. This is slower but provides the strongest durability guarantees.
-
+- `sync = false` (Eventual): Commits are guaranteed to be persistent eventually. Data is written to the kernel buffer but not fsynced. This provides the best performance.
+- `sync = true` (Immediate): Commits are guaranteed to be persistent as soon as `apply()` returns. Data is fsynced to disk. This is slower but provides the strongest durability guarantees.
 
 ## Time-Travel Queries
 
@@ -275,27 +343,32 @@ Time-travel queries allow you to read historical versions of your data at specif
 ### Enabling Versioning
 
 ```rust
-use surrealkv::{Options, TreeBuilder};
+use surrealos::{Options, StoreBuilder};
 
-let opts = Options::new()
-    .with_path("path/to/db".into())
-    .with_versioning(true, 0);  // retention_ns = 0 means no retention limit
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let opts = Options::new()
+        .with_path("path/to/db".into())
+        .with_versioning(true, 0);  // retention_ns = 0 means no retention limit
 
-let tree = TreeBuilder::with_options(opts).build()?;
+    let store = StoreBuilder::with_options(opts).build().await?;
+
+    Ok(())
+}
 ```
 
 ### Writing Versioned Data
 
 ```rust
 // Write data with explicit timestamps
-let mut tx = tree.begin()?;
-tx.set_at(b"key1", b"value_v1", 100)?;
-tx.commit().await?;
+let mut batch = store.new_batch();
+batch.set_at(b"key1", b"value_v1", 100)?;
+store.apply(batch, false).await?;
 
 // Update with a new version at a later timestamp
-let mut tx = tree.begin()?;
-tx.set_at(b"key1", b"value_v2", 200)?;
-tx.commit().await?;
+let mut batch = store.new_batch();
+batch.set_at(b"key1", b"value_v2", 200)?;
+store.apply(batch, false).await?;
 ```
 
 ### Point-in-Time Reads
@@ -303,92 +376,60 @@ tx.commit().await?;
 Query data as it existed at a specific timestamp:
 
 ```rust
-let tx = tree.begin()?;
+let snapshot = store.new_snapshot();
 
 // Get value at specific timestamp
-let value = tx.get_at(b"key1", 100)?;
+let value = snapshot.get_at(b"key1", 100).await?;
 assert_eq!(value.unwrap().as_ref(), b"value_v1");
 
 // Get value at later timestamp
-let value = tx.get_at(b"key1", 200)?;
+let value = snapshot.get_at(b"key1", 200).await?;
 assert_eq!(value.unwrap().as_ref(), b"value_v2");
 ```
 
 ### Retrieving All Versions
 
-Use the unified `history()` API to iterate over all historical versions of keys in a range.
-This API uses streaming iteration (no memory collection) and works with both LSM and B+tree backends:
+Use the `history_iter()` API to iterate over all historical versions of keys in a range:
 
 ```rust
-let tx = tree.begin()?;
-let mut iter = tx.history(b"key1", b"key2")?;
+use surrealos::LSMIterator;
 
-iter.seek_first()?;
+let snapshot = store.new_snapshot();
+let mut iter = snapshot.history_iter(
+    Some(b"key1".as_ref()),  // lower bound (inclusive)
+    Some(b"key2".as_ref()),  // upper bound (exclusive)
+    false,                    // include_tombstones
+    None,                     // ts_range filter
+    None,                     // limit
+)?;
+
+iter.seek_first().await?;
 while iter.valid() {
-    let key = iter.key();
-    let timestamp = iter.timestamp();
+    let key_ref = iter.key();
+    let user_key = key_ref.user_key();
+    let timestamp = key_ref.timestamp();
 
-    if iter.is_tombstone() {
-        println!("Key {:?} deleted at timestamp {}", key, timestamp);
+    if key_ref.is_tombstone() {
+        println!("Key {:?} deleted at timestamp {}", user_key, timestamp);
     } else {
         let value = iter.value()?;
-        println!("Key {:?} = {:?} at timestamp {}", key, value, timestamp);
+        println!("Key {:?} = {:?} at timestamp {}", user_key, value, timestamp);
     }
-    iter.next()?;
+    iter.next().await?;
 }
 ```
 
-For more control, use `history_with_options()`:
+With filtering options:
 
 ```rust
-use surrealkv::HistoryOptions;
-
-let tx = tree.begin()?;
-let opts = HistoryOptions::new()
-    .with_tombstones(true)  // Include deleted entries
-    .with_limit(100);       // Limit to 100 unique keys
-
-let mut iter = tx.history_with_options(b"key1", b"key2", &opts)?;
-iter.seek_first()?;
-while iter.valid() {
-    let key = iter.key();
-    let timestamp = iter.timestamp();
-    if iter.is_tombstone() {
-        println!("Key {:?} deleted at timestamp {}", key, timestamp);
-    } else {
-        let value = iter.value()?;
-        println!("Key {:?} = {:?} at timestamp {}", key, value, timestamp);
-    }
-    iter.next()?;
-}
-```
-
-## Advanced Read Options
-
-Use `ReadOptions` for fine-grained control over read operations:
-
-```rust
-use surrealkv::ReadOptions;
-
-let tx = tree.begin()?;
-
-// Range query with bounds using setter methods
-let mut options = ReadOptions::new();
-options.set_iterate_lower_bound(Some(b"a".to_vec()));
-options.set_iterate_upper_bound(Some(b"z".to_vec()));
-
-// Use cursor-based iteration
-let mut iter = tx.range_with_options(&options)?;
-iter.seek_first()?;
-while iter.valid() {
-    let key = iter.key();
-    let value = iter.value()?;
-    println!("{:?} = {:?}", key, value);
-    iter.next()?;
-}
-
-// Point-in-time read (requires versioning enabled)
-let value = tx.get_at(b"key1", 12345)?;
+let snapshot = store.new_snapshot();
+let mut iter = snapshot.history_iter(
+    Some(b"key1".as_ref()),
+    Some(b"key2".as_ref()),
+    true,                       // include tombstones
+    Some((100, 200)),           // only versions with timestamp in [100, 200]
+    Some(100),                  // limit to 100 entries
+)?;
 ```
 
 ## Checkpoint and Restore
@@ -398,19 +439,18 @@ Create consistent point-in-time snapshots of your database for backup and recove
 ### Creating Checkpoints
 
 ```rust
-let tree = TreeBuilder::new()
+let store = StoreBuilder::new()
     .with_path("path/to/db".into())
-    .build()?;
+    .build()
+    .await?;
 
 // Insert some data
-let mut txn = tree.begin()?;
-txn.set(b"key1", b"value1")?;
-txn.set(b"key2", b"value2")?;
-txn.commit().await?;
+store.set(b"key1", b"value1").await?;
+store.set(b"key2", b"value2").await?;
 
 // Create checkpoint
 let checkpoint_dir = "path/to/checkpoint";
-let metadata = tree.create_checkpoint(&checkpoint_dir)?;
+let metadata = store.create_checkpoint(&checkpoint_dir).await?;
 
 println!("Checkpoint created at timestamp: {}", metadata.timestamp);
 println!("Sequence number: {}", metadata.sequence_number);
@@ -422,31 +462,42 @@ println!("Total size: {} bytes", metadata.total_size);
 
 ```rust
 // Restore database to checkpoint state
-tree.restore_from_checkpoint(&checkpoint_dir)?;
+store.restore_from_checkpoint(&checkpoint_dir).await?;
 
 // Data is now restored to the checkpoint state
 // Any data written after checkpoint creation is discarded
+```
+
+### Cloud Checkpoints
+
+SurrealOS supports cloud-native checkpoint operations when using an object store:
+
+```rust
+// Create a named checkpoint in the object store
+let metadata = store.create_cloud_checkpoint("backup-2024-01-01").await?;
+
+// Restore from a cloud checkpoint
+let metadata = store.restore_cloud_checkpoint("backup-2024-01-01").await?;
 ```
 
 **What's included in a checkpoint:**
 - All SSTables from all levels
 - Current WAL segments
 - Level manifest
-- VLog directories (if VLog is enabled)
-- Checkpoint metadata
+- Checkpoint metadata (binary format)
 
 **Note:** Restoring from a checkpoint discards any pending writes in the active memtable and returns the database to the exact state when the checkpoint was created.
 
 ## Platform Compatibility
 
-### ✅ Supported Platforms
+### Supported Platforms
 - **Linux** (x86_64, aarch64): Full support including all features and tests
 - **macOS** (x86_64, aarch64): Full support including all features and tests
 
-### ❌ Not Supported
+### Not Supported
 - **WebAssembly (WASM)**: Not supported due to fundamental incompatibilities:
   - Requires file system access not available in WASM environments
-  - Write-Ahead Log (WAL) and Value Log (VLog) operations are not compatible
+  - Write-Ahead Log (WAL) operations are not compatible
   - System-level I/O operations are not available
 
 - **Windows** (x86_64): Basic functionality supported, but some features are limited:
@@ -456,7 +507,7 @@ tree.restore_from_checkpoint(&checkpoint_dir)?;
 
 ## History
 
-SurrealKV has undergone a significant architectural evolution to address scalability challenges:
+SurrealOS has undergone a significant architectural evolution to address scalability challenges:
 
 ### Previous Design (VART-based)
 The original implementation used a **versioned adaptive radix trie (VART)** architecture with the following components:
@@ -475,15 +526,17 @@ The VART-based design had fundamental scalability limitations:
 The new LSM (Log-Structured Merge) tree architecture provides:
 
 - **Better Scalability**: Supports datasets much larger than available memory
-- **Leveled Compaction**: Score-based compaction strategy for efficient space utilization
+- **Leveled Compaction**: Beat/bar pacing model for predictable, incremental compaction
+- **Cloud-Native Storage**: Object store abstraction for S3, GCS, Azure backends
+- **Distributed Coordination**: Writer/compactor fencing for multi-node deployments
 
-This architectural change enables SurrealKV to handle larger than memory datasets.
+This architectural change enables SurrealOS to handle larger than memory datasets.
 
 For detailed architecture documentation, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## References
-SurrealKV draws inspiration from design ideas used in [RocksDB](https://github.com/facebook/rocksdb) and [Pebble](https://github.com/cockroachdb/pebble)
 
+SurrealOS draws inspiration from design ideas used in [RocksDB](https://github.com/facebook/rocksdb), [Pebble](https://github.com/cockroachdb/pebble), and [TigerBeetle](https://tigerbeetle.com/).
 
 ## License
 

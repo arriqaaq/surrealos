@@ -30,21 +30,12 @@ pub enum Error {
 	BlockNotFound,
 	BatchTooLarge,
 	InvalidBatchRecord,
-	TransactionWriteConflict,
-	TransactionRetry,
-	TransactionClosed,
 	EmptyKey,
-	TransactionWriteOnly,
-	TransactionReadOnly,
-	TransactionWithoutSavepoint,
 	KeyNotFound,
-	WriteStall {
-		reason: WriteStallReason,
-	},
 	ArenaFull, // Memtable arena is full, need rotation
 	FileDescriptorNotFound,
-	TableIDCollision(u64),
-	TableNotFound(u64),
+	TableIDCollision(crate::sstable::SstId),
+	TableNotFound(crate::sstable::SstId),
 	PipelineStall,
 	Other(String), // Other errors
 	NoSnapshot,
@@ -64,6 +55,11 @@ pub enum Error {
 		message: String,
 	},
 	SSTable(crate::sstable::error::SSTableError), // SSTable-specific errors
+	Fenced,                                       /* Writer or compactor has been fenced by a
+	                                               * newer instance */
+	ManifestVersionExists, // CAS failed: manifest version already written by another writer
+	ObjectStoreError(String), // Object store operation failed
+	InvalidDeletion,       // Attempted to delete active manifest
 }
 
 // Implementation of Display trait for Error
@@ -87,15 +83,8 @@ impl fmt::Display for Error {
             Self::BlockNotFound => write!(f, "Block not found"),
             Self::BatchTooLarge => write!(f, "Batch too large"),
             Self::InvalidBatchRecord => write!(f, "Invalid batch record"),
-            Self::TransactionWriteConflict => write!(f, "Transaction write conflict"),
-            Self::TransactionRetry => write!(f, "Transaction retry required: memtable history insufficient for conflict detection"),
-            Self::TransactionClosed => write!(f, "Transaction closed"),
             Self::EmptyKey => write!(f, "Empty key"),
-            Self::TransactionWriteOnly => write!(f, "Transaction is write-only"),
-            Self::TransactionReadOnly => write!(f, "Transaction is read-only"),
-            Self::TransactionWithoutSavepoint => write!(f, "Transaction has no savepoint to rollback to"),
             Self::KeyNotFound => write!(f, "Key not found"),
-            Self::WriteStall { reason } => write!(f, "Write stall: {:?}", reason),
             Self::ArenaFull => write!(f, "Memtable arena is full"),
             Self::FileDescriptorNotFound => write!(f, "File descriptor not found"),
 			Self::TableIDCollision(id) => write!(f, "CRITICAL ERROR: Table ID collision detected. New table ID {id} conflicts with a table ID in the merge list."),
@@ -117,6 +106,10 @@ impl fmt::Display for Error {
                 segment_id, offset, message
             ),
             Self::SSTable(err) => write!(f, "SSTable error: {err}"),
+            Self::Fenced => write!(f, "Writer or compactor has been fenced by a newer instance"),
+            Self::ManifestVersionExists => write!(f, "Manifest version already exists (CAS conflict)"),
+            Self::ObjectStoreError(err) => write!(f, "Object store error: {err}"),
+            Self::InvalidDeletion => write!(f, "Attempted to delete active manifest"),
         }
 	}
 }
@@ -155,6 +148,12 @@ impl From<crate::sstable::error::SSTableError> for Error {
 	}
 }
 
+impl From<object_store::Error> for Error {
+	fn from(e: object_store::Error) -> Self {
+		Error::ObjectStoreError(e.to_string())
+	}
+}
+
 impl<T> From<std::sync::PoisonError<T>> for Error {
 	fn from(_err: std::sync::PoisonError<T>) -> Self {
 		Error::Other("Lock poisoned - another thread panicked while holding the lock".to_string())
@@ -181,18 +180,8 @@ pub enum ErrorSeverity {
 /// Reason for background error (for classification)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackgroundErrorReason {
-	MemtablaFlush,
 	Compaction,
 	ManifestWrite,
-}
-
-/// Reason for write stall - used for logging and metrics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WriteStallReason {
-	/// Too many immutable memtables queued for flush
-	MemtableLimit,
-	/// Too many L0 files awaiting compaction
-	L0FileLimit,
 }
 
 /// Represents a background error with its severity and context
@@ -238,14 +227,14 @@ impl BackgroundErrorHandler {
 			// Corrupted table metadata is unrecoverable
 			(_, Error::CorruptedTableMetadata(_)) => ErrorSeverity::Unrecoverable,
 
-			// I/O errors during memtable flush are fatal
-			(BackgroundErrorReason::MemtablaFlush, Error::Io(_)) => ErrorSeverity::FatalError,
-
 			// I/O errors during compaction are fatal
 			(BackgroundErrorReason::Compaction, Error::Io(_)) => ErrorSeverity::FatalError,
 
 			// Manifest write I/O is fatal
 			(BackgroundErrorReason::ManifestWrite, Error::Io(_)) => ErrorSeverity::FatalError,
+
+			// Fenced errors are fatal -- another instance has taken over
+			(_, Error::Fenced) => ErrorSeverity::FatalError,
 
 			// Default: treat as hard error for safety
 			_ => ErrorSeverity::HardError,
@@ -382,7 +371,7 @@ mod tests {
 		// Set a hard error
 		handler.set_error(
 			Error::Io(Arc::new(std::io::Error::other("test error"))),
-			BackgroundErrorReason::MemtablaFlush,
+			BackgroundErrorReason::Compaction,
 		);
 
 		assert!(handler.is_db_stopped());
@@ -405,7 +394,7 @@ mod tests {
 		// Set a fatal error - should upgrade
 		handler.set_error(
 			Error::Io(Arc::new(std::io::Error::other("fatal error"))),
-			BackgroundErrorReason::MemtablaFlush,
+			BackgroundErrorReason::Compaction,
 		);
 
 		assert!(handler.is_db_stopped());
@@ -421,7 +410,7 @@ mod tests {
 		// Set a hard error first
 		handler.set_error(
 			Error::Io(Arc::new(std::io::Error::other("hard error"))),
-			BackgroundErrorReason::MemtablaFlush,
+			BackgroundErrorReason::Compaction,
 		);
 
 		let first_error = handler.get_error().unwrap().error;
@@ -443,7 +432,7 @@ mod tests {
 
 		handler.set_error(
 			Error::Io(Arc::new(std::io::Error::other("test error"))),
-			BackgroundErrorReason::MemtablaFlush,
+			BackgroundErrorReason::Compaction,
 		);
 
 		assert!(handler.is_db_stopped());
