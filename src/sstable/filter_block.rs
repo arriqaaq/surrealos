@@ -130,6 +130,11 @@ impl FilterBlockReader {
 		}
 	}
 
+	/// Returns the byte size of the encoded filter block data.
+	pub(crate) fn size(&self) -> usize {
+		self.data.len()
+	}
+
 	// Checks if a key may be present in the filter block, given a specific block
 	// offset.
 	pub(crate) fn may_contain(&self, key: &[u8], block_offset: usize) -> bool {

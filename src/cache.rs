@@ -6,17 +6,20 @@ use quick_cache::sync::Cache as QCache;
 use quick_cache::{Equivalent, Weighter};
 
 use crate::sstable::block::Block;
+use crate::sstable::filter_block::FilterBlockReader;
 use crate::sstable::SstId;
 
 /// Kind constants for differentiating cache entry types
 const KIND_DATA: u8 = 0;
 const KIND_INDEX: u8 = 1;
+const KIND_FILTER: u8 = 2;
 const KIND_DATA_HISTORY: u8 = 3;
 
 #[derive(Clone)]
 pub(crate) enum Item {
 	Data(Arc<Block>),
 	Index(Arc<Block>),
+	Filter(Arc<FilterBlockReader>),
 }
 
 /// Cache key with kind-based differentiation.
@@ -54,6 +57,7 @@ impl Weighter<CacheKey, Item> for BlockWeighter {
 		match item {
 			Item::Data(block) => block.size() as u64,
 			Item::Index(block) => block.size() as u64,
+			Item::Filter(f) => f.size() as u64,
 		}
 	}
 }
@@ -112,6 +116,29 @@ impl BlockCache {
 	/// Inserts an index block into the cache.
 	pub(crate) fn insert_index_block(&self, table_id: SstId, offset: u64, block: Arc<Block>) {
 		self.data.insert((KIND_INDEX, table_id, offset).into(), Item::Index(block));
+	}
+
+	/// Inserts a filter block into the cache.
+	pub(crate) fn insert_filter_block(
+		&self,
+		table_id: SstId,
+		offset: u64,
+		f: Arc<FilterBlockReader>,
+	) {
+		self.data.insert((KIND_FILTER, table_id, offset).into(), Item::Filter(f));
+	}
+
+	/// Retrieves a filter block from the cache.
+	pub(crate) fn get_filter_block(
+		&self,
+		table_id: SstId,
+		offset: u64,
+	) -> Option<Arc<FilterBlockReader>> {
+		let item = self.data.get(&(KIND_FILTER, table_id, &offset));
+		match item.as_ref()? {
+			Item::Filter(f) => Some(Arc::clone(f)),
+			_ => None,
+		}
 	}
 
 	/// Retrieves a data block from the cache.

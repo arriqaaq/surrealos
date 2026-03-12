@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -33,6 +35,10 @@ pub(crate) struct CloudStore {
 	path_resolver: StorePaths,
 	/// When Some, SST files are cached on local disk and reads prefer local files.
 	local_sst_dir: Option<PathBuf>,
+	/// Counts object-store GET requests (excluding local-disk cache hits).
+	/// Only present in test builds; used to assert cloud read counts in tests.
+	#[cfg(test)]
+	pub(crate) read_range_count: Arc<AtomicUsize>,
 }
 
 impl CloudStore {
@@ -45,6 +51,8 @@ impl CloudStore {
 			object_store,
 			path_resolver,
 			local_sst_dir,
+			#[cfg(test)]
+			read_range_count: Arc::new(AtomicUsize::new(0)),
 		}
 	}
 
@@ -82,6 +90,8 @@ impl CloudStore {
 			}
 		}
 		let path = self.path_resolver.table_path(id);
+		#[cfg(test)]
+		self.read_range_count.fetch_add(1, Ordering::Relaxed);
 		Ok(self.object_store.get_range(&path, range).await?)
 	}
 

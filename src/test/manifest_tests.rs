@@ -8,7 +8,7 @@ use crate::manifest::{
 	write_manifest_to_disk,
 	ManifestChangeSet,
 	SnapshotInfo,
-	MANIFEST_FORMAT_VERSION_V3,
+	MANIFEST_FORMAT_VERSION_V1,
 };
 use crate::sstable::table::TableWriter;
 use crate::sstable::SstId;
@@ -69,7 +69,7 @@ async fn test_level_manifest_persistence() {
 		manifest_id: 0,
 		levels,
 		hidden_set: HashSet::with_capacity(10),
-		manifest_format_version: MANIFEST_FORMAT_VERSION_V3,
+		manifest_format_version: MANIFEST_FORMAT_VERSION_V1,
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
@@ -142,7 +142,7 @@ async fn test_level_manifest_persistence() {
 	.expect("Failed to load manifest");
 
 	assert_eq!(
-		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V3,
+		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V1,
 		"Manifest version not persisted correctly"
 	);
 	assert_eq!(loaded_manifest.snapshots.len(), 2, "Snapshots not persisted correctly");
@@ -194,7 +194,7 @@ async fn test_level_manifest_persistence() {
 
 	// Verify all manifest fields were loaded correctly in the new manifest
 	assert_eq!(
-		new_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V3,
+		new_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V1,
 		"Manifest version not loaded correctly"
 	);
 	assert_eq!(new_manifest.snapshots.len(), 2, "Snapshots not loaded correctly");
@@ -403,7 +403,7 @@ fn new_test_manifest(opts: &Arc<Options>) -> LevelManifest {
 		manifest_id: 0,
 		levels,
 		hidden_set: HashSet::with_capacity(10),
-		manifest_format_version: MANIFEST_FORMAT_VERSION_V3,
+		manifest_format_version: MANIFEST_FORMAT_VERSION_V1,
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
@@ -781,7 +781,7 @@ async fn test_manifest_v1_with_log_number_and_last_sequence() {
 
 	// Verify format version is still V3
 	assert_eq!(
-		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V3,
+		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V1,
 		"Should be V3 format"
 	);
 
@@ -2239,4 +2239,145 @@ async fn test_manifest_checkpoint_recovery_cycles() {
 		// Continue using loaded manifest for next round (simulates restart)
 		manifest = loaded;
 	}
+}
+
+/// Verifies that `filter_handle` (offset + size) survives `Levels::encode()/decode()`.
+///
+/// Analogous to SlateDB's `test_should_encode_decode_ssts_with_visible_ranges` —
+/// directly validates the new V1 binary format for the filter_handle field.
+#[tokio::test]
+async fn test_levels_filter_handle_roundtrip() {
+	use std::io::Cursor;
+
+	use crate::levels::level::{Level, Levels};
+
+	let store = test_table_store();
+
+	// --- Case 1: table written WITH bloom filter (Options::default() enables it) ---
+	let opts_with = Arc::new(Options::default());
+	let table_with =
+		create_test_table(test_sst_id(1), 20, Arc::clone(&opts_with), Arc::clone(&store))
+			.await
+			.unwrap();
+
+	let original_handle = table_with.filter_handle.clone();
+	assert!(original_handle.is_some(), "bloom filter should have been written");
+
+	let levels_with = Levels(vec![Arc::new(Level {
+		tables: vec![Arc::clone(&table_with)],
+	})]);
+	let mut encoded = Vec::new();
+	levels_with.encode(&mut encoded).unwrap();
+
+	let decoded_with = Levels::decode(&mut Cursor::new(&encoded)).unwrap();
+	let entry_with = &decoded_with[0][0];
+	assert_eq!(
+		entry_with.filter_handle, original_handle,
+		"filter_handle must survive Levels encode/decode round-trip"
+	);
+
+	// --- Case 2: table written WITHOUT bloom filter ---
+	let opts_none = Arc::new(Options::default().with_filter_policy(None));
+	let table_none =
+		create_test_table(test_sst_id(2), 20, Arc::clone(&opts_none), Arc::clone(&store))
+			.await
+			.unwrap();
+
+	assert!(table_none.filter_handle.is_none(), "no filter handle expected");
+
+	let levels_none = Levels(vec![Arc::new(Level {
+		tables: vec![Arc::clone(&table_none)],
+	})]);
+	let mut encoded_none = Vec::new();
+	levels_none.encode(&mut encoded_none).unwrap();
+
+	let decoded_none = Levels::decode(&mut Cursor::new(&encoded_none)).unwrap();
+	assert!(
+		decoded_none[0][0].filter_handle.is_none(),
+		"filter_handle should remain None when no filter policy"
+	);
+}
+
+/// Full manifest write → reload → `Table::get()` with bloom filter active.
+///
+/// Analogous to SlateDB's `test_put_get_reopen_delete_with_separate_wal_store`.
+/// Verifies that `filter_handle` is preserved across the manifest round-trip and
+/// that the filter correctly functions after reload (both hit and miss paths).
+#[tokio::test]
+async fn test_manifest_reload_filter_works() {
+	use std::collections::HashSet;
+	use std::path::PathBuf;
+
+	use crate::levels::LevelManifest;
+	use crate::manifest::{load_from_bytes, serialize_manifest};
+
+	let store = test_table_store();
+	let opts = Arc::new(Options::default()); // bloom filter on by default
+
+	// Write an SST with known keys
+	let table_id = test_sst_id(50);
+	let num_keys: u64 = 20;
+	let table =
+		create_test_table(table_id, num_keys, Arc::clone(&opts), Arc::clone(&store)).await.unwrap();
+
+	assert!(table.filter_handle.is_some(), "bloom filter should have been written");
+	let original_handle = table.filter_handle.clone();
+
+	// Build a manifest with the table in level 0
+	let mut manifest = LevelManifest {
+		manifest_dir: PathBuf::from("/tmp"),
+		manifest_id: 0,
+		levels: LevelManifest::initialize_levels_for_test(opts.level_count),
+		hidden_set: HashSet::with_capacity(10),
+		manifest_format_version: crate::manifest::MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+		writer_epoch: 0,
+		compactor_epoch: 0,
+		leader_id: 0,
+	};
+	manifest
+		.apply_changeset(&ManifestChangeSet {
+			new_tables: vec![(0, Arc::clone(&table))],
+			..Default::default()
+		})
+		.unwrap();
+
+	// Serialize without writing to disk
+	let bytes = serialize_manifest(&manifest).unwrap();
+
+	// Reload with fresh opts (fresh block_cache) — simulates a cold restart
+	let opts_reload = Arc::new(Options::default());
+	let loaded = load_from_bytes(
+		&bytes,
+		PathBuf::from("/tmp"),
+		Arc::clone(&opts_reload),
+		Arc::clone(&store),
+	)
+	.await
+	.unwrap();
+
+	// filter_handle must be preserved
+	let reloaded_table = &loaded.levels.as_ref()[0].tables[0];
+	assert_eq!(
+		reloaded_table.filter_handle, original_handle,
+		"filter_handle must survive manifest round-trip"
+	);
+
+	// get() for a key that EXISTS — filter should pass it through
+	let existing_key = InternalKey::new(
+		b"key_00000".to_vec(),
+		u64::MAX, // latest version
+		InternalKeyKind::Set,
+		0,
+	);
+	let result = reloaded_table.get(&existing_key).await.unwrap();
+	assert!(result.is_some(), "get() should find an existing key after manifest reload");
+
+	// get() for a key that DOES NOT EXIST — filter should reject it early
+	let missing_key =
+		InternalKey::new(b"zzz_no_such_key".to_vec(), u64::MAX, InternalKeyKind::Set, 0);
+	let result = reloaded_table.get(&missing_key).await.unwrap();
+	assert!(result.is_none(), "get() should return None for a missing key");
 }

@@ -4988,6 +4988,107 @@ async fn test_all_zero_seq_nums() {
 	assert_eq!(table.meta.properties.seqnos, (0, 0));
 }
 
+/// Tests that Table::open() makes exactly 1 cloud read (top-level index only),
+/// and that load_filter() hits the cloud on first call and the cache on subsequent calls.
+#[tokio::test]
+async fn test_sst_open_cloud_read_count() {
+	use std::sync::atomic::Ordering;
+
+	use crate::sstable::bloom::LevelDBBloomFilter;
+	use crate::sstable::table::Table;
+	use crate::test::test_table_store;
+
+	// Options: bloom filter enabled, non-trivial block cache
+	let opts = Arc::new(
+		Options::new()
+			.with_filter_policy(Some(Arc::new(LevelDBBloomFilter::new(10))))
+			.with_block_restart_interval(3),
+	);
+
+	// InMemory store, NO local SST cache
+	let cloud_store = test_table_store();
+
+	// Write an SST with a few keys
+	let id = test_sst_id(99);
+	let mut buffer = Vec::new();
+	let mut writer = crate::sstable::table::TableWriter::new(&mut buffer, id, Arc::clone(&opts), 0);
+	for i in 0u64..20 {
+		let key = format!("key_{i:03}");
+		writer
+			.add(
+				InternalKey::new(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set, 0),
+				b"value",
+			)
+			.unwrap();
+	}
+	writer.finish().unwrap();
+	let file_size = buffer.len() as u64;
+	cloud_store.write_sst(&id, bytes::Bytes::from(buffer)).await.unwrap();
+
+	// Open via Table::new() — reads footer + index + meta index + filter
+	let cold =
+		Table::new(id, Arc::clone(&opts), Arc::clone(&cloud_store), file_size).await.unwrap();
+	let filter_handle = cold.filter_handle.clone();
+	assert!(filter_handle.is_some(), "bloom filter should have been written");
+
+	// Create fresh opts (new block cache) to simulate a cold restart
+	let opts_open = Arc::new(
+		Options::new()
+			.with_filter_policy(Some(Arc::new(LevelDBBloomFilter::new(10))))
+			.with_block_restart_interval(3),
+	);
+
+	// Table::open() — must make exactly 1 cloud read (top-level index)
+	cloud_store.read_range_count.store(0, Ordering::SeqCst);
+	let table = Table::open(
+		id,
+		Arc::clone(&opts_open),
+		Arc::clone(&cloud_store),
+		file_size,
+		cold.footer.clone(),
+		cold.meta.clone(),
+		filter_handle,
+	)
+	.await
+	.unwrap();
+	assert_eq!(
+		cloud_store.read_range_count.load(Ordering::SeqCst),
+		1,
+		"Table::open() should make exactly 1 cloud read"
+	);
+
+	// First load_filter() — 1 cloud read (cache miss)
+	cloud_store.read_range_count.store(0, Ordering::SeqCst);
+	let f1 = table.load_filter().await.unwrap();
+	assert!(f1.is_some(), "filter should be loadable");
+	assert_eq!(
+		cloud_store.read_range_count.load(Ordering::SeqCst),
+		1,
+		"first load_filter() should make 1 cloud read"
+	);
+
+	// Second load_filter() — 0 reads (BlockCache hit)
+	cloud_store.read_range_count.store(0, Ordering::SeqCst);
+	let f2 = table.load_filter().await.unwrap();
+	assert!(f2.is_some());
+	assert_eq!(
+		cloud_store.read_range_count.load(Ordering::SeqCst),
+		0,
+		"second load_filter() should hit cache"
+	);
+
+	// Clone: cache hit shared (same opts.block_cache)
+	let table2 = table.clone();
+	cloud_store.read_range_count.store(0, Ordering::SeqCst);
+	let f3 = table2.load_filter().await.unwrap();
+	assert!(f3.is_some());
+	assert_eq!(
+		cloud_store.read_range_count.load(Ordering::SeqCst),
+		0,
+		"cloned table load_filter() should hit cache"
+	);
+}
+
 /// Tests that all entries having timestamp=0 works correctly.
 #[tokio::test]
 async fn test_all_zero_timestamps() {
