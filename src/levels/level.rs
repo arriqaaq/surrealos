@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
+use crate::sstable::block::BlockHandle;
 use crate::sstable::meta::TableMetadata;
 use crate::sstable::table::{Footer, Table};
 use crate::sstable::SstId;
@@ -100,13 +101,16 @@ impl Level {
 	}
 }
 
-/// Entry decoded from a V3 manifest, containing all metadata needed to open a table
+/// Entry decoded from a manifest, containing all metadata needed to open a table
 /// without additional object store reads.
 pub(crate) struct TableEntry {
 	pub id: SstId,
 	pub file_size: u64,
 	pub footer: Footer,
 	pub metadata: TableMetadata,
+	/// Handle pointing to the filter block within the SST file.
+	/// `None` if no filter policy was configured when the SST was written.
+	pub filter_handle: Option<BlockHandle>,
 }
 
 /// Represents all levels in the LSM tree
@@ -125,10 +129,10 @@ impl Levels {
 		self.0.iter().map(|level| level.tables.len()).sum()
 	}
 
-	/// Encodes the levels structure to a writer in binary format (V3).
+	/// Encodes the levels structure to a writer.
 	/// Format: levels count (u8), then per level: table count (u32),
 	/// then per table: id (u128) | file_size (u64) | footer_len (u32) | footer_bytes |
-	/// metadata_len (u32) | metadata_bytes.
+	/// metadata_len (u32) | metadata_bytes | has_filter (u8) | [offset (u64) + size (u64)].
 	pub(crate) fn encode<W: Write>(&self, writer: &mut W) -> Result<()> {
 		writer.write_u8(self.0.len() as u8)?;
 
@@ -148,13 +152,21 @@ impl Levels {
 				let meta_bytes = table.meta.encode();
 				writer.write_u32::<BigEndian>(meta_bytes.len() as u32)?;
 				writer.write_all(&meta_bytes)?;
+				// Filter handle: 1-byte tag, then offset+size as u64 if present
+				if let Some(ref fh) = table.filter_handle {
+					writer.write_u8(1)?;
+					writer.write_u64::<BigEndian>(fh.offset as u64)?;
+					writer.write_u64::<BigEndian>(fh.size as u64)?;
+				} else {
+					writer.write_u8(0)?;
+				}
 			}
 		}
 
 		Ok(())
 	}
 
-	/// Decodes levels structure from a reader (V3 format).
+	/// Decodes levels structure from a reader.
 	/// Returns TableEntry per table per level.
 	pub(crate) fn decode<R: Read>(reader: &mut R) -> Result<Vec<Vec<TableEntry>>> {
 		let level_count = reader.read_u8()?;
@@ -180,11 +192,24 @@ impl Levels {
 				reader.read_exact(&mut meta_bytes)?;
 				let metadata = TableMetadata::decode(&meta_bytes)?;
 
+				// Filter handle: 1-byte tag, then offset+size as u64 if present
+				let filter_handle = if reader.read_u8()? == 1 {
+					let offset = reader.read_u64::<BigEndian>()? as usize;
+					let size = reader.read_u64::<BigEndian>()? as usize;
+					Some(BlockHandle {
+						offset,
+						size,
+					})
+				} else {
+					None
+				};
+
 				level.push(TableEntry {
 					id,
 					file_size,
 					footer,
 					metadata,
+					filter_handle,
 				});
 			}
 

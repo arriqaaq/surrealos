@@ -17,8 +17,8 @@ use crate::sstable::SstId;
 use crate::wal::list_segment_ids;
 use crate::{Options, Result};
 
-/// Manifest format version V3: full metadata (footer + TableMetadata) per table
-pub const MANIFEST_FORMAT_VERSION_V3: u16 = 3;
+/// Manifest format version: stores filter_handle per table for lazy filter loading.
+pub const MANIFEST_FORMAT_VERSION_V1: u16 = 1;
 
 /// Snapshot information stored in the manifest
 #[derive(Debug, Clone)]
@@ -152,7 +152,7 @@ pub(crate) async fn load_from_bytes(
 	let mut cursor = Cursor::new(data);
 
 	let version = cursor.read_u16::<BigEndian>()?;
-	if version != MANIFEST_FORMAT_VERSION_V3 {
+	if version != MANIFEST_FORMAT_VERSION_V1 {
 		return Err(Error::LoadManifestFail(format!(
 			"Unsupported manifest format version: {}",
 			version
@@ -203,6 +203,7 @@ pub(crate) async fn load_from_bytes(
 				entry.file_size,
 				entry.footer,
 				entry.metadata,
+				entry.filter_handle,
 			)
 			.await
 			{
@@ -484,7 +485,7 @@ pub(crate) fn extract_sst_ids_from_manifest(data: &[u8]) -> Result<HashSet<SstId
 	let mut cursor = Cursor::new(data);
 
 	let version = cursor.read_u16::<BigEndian>()?;
-	if version != MANIFEST_FORMAT_VERSION_V3 {
+	if version != MANIFEST_FORMAT_VERSION_V1 {
 		return Err(Error::LoadManifestFail(format!(
 			"Unsupported manifest format version: {}",
 			version

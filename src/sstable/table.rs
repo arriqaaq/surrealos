@@ -750,7 +750,10 @@ pub(crate) struct Table {
 	pub(crate) meta: TableMetadata,
 
 	pub(crate) index_block: IndexType,
-	pub(crate) filter_reader: Option<FilterBlockReader>,
+	/// Handle (offset + size) of the filter block within the SST file.
+	/// The filter data itself lives in `opts.block_cache` — loaded lazily on
+	/// the first point lookup via `load_filter()`.
+	pub(crate) filter_handle: Option<BlockHandle>,
 }
 
 impl Clone for Table {
@@ -763,7 +766,7 @@ impl Clone for Table {
 			opts: Arc::clone(&self.opts),
 			meta: self.meta.clone(),
 			index_block: self.index_block.clone(),
-			filter_reader: self.filter_reader.clone(),
+			filter_handle: self.filter_handle.clone(),
 		}
 	}
 }
@@ -798,9 +801,16 @@ impl Table {
 		let writer_metadata =
 			read_writer_meta_properties(&metaindexblock)?.ok_or(Error::TableMetadataNotFound)?;
 
-		// Step 5: Load filter block if configured
-		let filter_reader = if opts.filter_policy.is_some() {
-			Self::read_filter_block_async(&metaindexblock, &table_store, id, &opts).await?
+		// Step 5: Load filter block if configured; pre-populate cache and save handle
+		let filter_handle = if opts.filter_policy.is_some() {
+			if let Some((reader, handle)) =
+				Self::read_filter_block(&metaindexblock, &table_store, id, &opts).await?
+			{
+				opts.block_cache.insert_filter_block(id, handle.offset() as u64, Arc::new(reader));
+				Some(handle)
+			} else {
+				None
+			}
 		} else {
 			None
 		};
@@ -811,15 +821,15 @@ impl Table {
 			file_size,
 			footer,
 			opts,
-			filter_reader,
+			filter_handle,
 			index_block,
 			meta: writer_metadata,
 		})
 	}
 
 	/// Opens an SSTable using pre-loaded metadata from the manifest.
-	/// Only reads the index block and filter block from object store (2 reads
-	/// instead of 4).
+	/// Makes exactly 1 cloud read (top-level index block).
+	/// Filter is loaded lazily on the first point lookup via `load_filter()`.
 	pub(crate) async fn open(
 		id: SstId,
 		opts: Arc<Options>,
@@ -827,26 +837,18 @@ impl Table {
 		file_size: u64,
 		footer: Footer,
 		meta: TableMetadata,
+		filter_handle: Option<BlockHandle>,
 	) -> Result<Table> {
-		// Load top-level index block
+		// 1 cloud read: top-level index block only
 		let top_level_block = table_store
 			.read_table_block(&id, &footer.index, Arc::clone(&opts.internal_comparator))
 			.await?;
-		let index_block = {
-			let partitioned_index =
-				Index::new(id, Arc::clone(&opts), Arc::clone(&table_store), top_level_block)?;
-			IndexType::Partitioned(partitioned_index)
-		};
-
-		// Load meta index block (needed for filter)
-		let filter_reader = if opts.filter_policy.is_some() {
-			let metaindexblock = table_store
-				.read_table_block(&id, &footer.meta_index, Arc::clone(&opts.internal_comparator))
-				.await?;
-			Self::read_filter_block_async(&metaindexblock, &table_store, id, &opts).await?
-		} else {
-			None
-		};
+		let index_block = IndexType::Partitioned(Index::new(
+			id,
+			Arc::clone(&opts),
+			Arc::clone(&table_store),
+			top_level_block,
+		)?);
 
 		Ok(Table {
 			id,
@@ -854,7 +856,7 @@ impl Table {
 			file_size,
 			footer,
 			opts,
-			filter_reader,
+			filter_handle,
 			index_block,
 			meta,
 		})
@@ -865,12 +867,14 @@ impl Table {
 		&self.footer
 	}
 
-	async fn read_filter_block_async(
+	/// Reads the filter block and returns both the reader and the block handle.
+	/// Used only in `Table::new()` (first open from raw SST, not from manifest).
+	async fn read_filter_block(
 		metaix: &Block,
 		table_store: &Arc<CloudStore>,
 		table_id: SstId,
 		options: &Options,
-	) -> Result<Option<FilterBlockReader>> {
+	) -> Result<Option<(FilterBlockReader, BlockHandle)>> {
 		let filter_name = format!("filter.{}", options.filter_policy.as_ref().unwrap().name());
 		let filter_key =
 			InternalKey::new(Vec::from(filter_name.as_bytes()), 0, InternalKeyKind::Set, 0);
@@ -896,10 +900,30 @@ impl Table {
 			if filter_block_location.size() > 0 {
 				let buf = table_store.read_block_bytes(&table_id, &filter_block_location).await?;
 				let policy = Arc::clone(options.filter_policy.as_ref().unwrap());
-				return Ok(Some(FilterBlockReader::new(buf.to_vec(), policy)));
+				let reader = FilterBlockReader::new(buf.to_vec(), policy);
+				return Ok(Some((reader, filter_block_location)));
 			}
 		}
 		Ok(None)
+	}
+
+	/// Loads the filter block for this SST, checking `block_cache` first.
+	/// Returns `None` if no filter policy is configured or no filter block exists.
+	pub(crate) async fn load_filter(&self) -> Result<Option<Arc<FilterBlockReader>>> {
+		let fh = match self.filter_handle {
+			Some(ref h) if self.opts.filter_policy.is_some() => h,
+			_ => return Ok(None),
+		};
+		// Cache hit (most common path after first access)
+		if let Some(f) = self.opts.block_cache.get_filter_block(self.id, fh.offset() as u64) {
+			return Ok(Some(f));
+		}
+		// Cache miss: read raw bytes (filter is CompressionType::None)
+		let buf = self.table_store.read_block_bytes(&self.id, fh).await?;
+		let policy = Arc::clone(self.opts.filter_policy.as_ref().unwrap());
+		let reader = Arc::new(FilterBlockReader::new(buf.to_vec(), policy));
+		self.opts.block_cache.insert_filter_block(self.id, fh.offset() as u64, Arc::clone(&reader));
+		Ok(Some(reader))
 	}
 
 	/// Reads a data block, using cache if available.
@@ -979,8 +1003,8 @@ impl Table {
 	pub(crate) async fn get(&self, key: &InternalKey) -> Result<Option<(InternalKey, Value)>> {
 		let key_encoded = key.encode();
 
-		// Step 1: Bloom filter for early rejection
-		if let Some(ref filters) = self.filter_reader {
+		// Step 1: Bloom filter for early rejection (lazy load from cache or cloud)
+		if let Some(filters) = self.load_filter().await? {
 			if !filters.may_contain(key.user_key.as_slice(), 0) {
 				return Ok(None);
 			}

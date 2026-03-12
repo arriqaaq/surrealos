@@ -17,7 +17,7 @@ use crate::manifest::{
 	ChangeSetRollback,
 	ManifestChangeSet,
 	SnapshotInfo,
-	MANIFEST_FORMAT_VERSION_V3,
+	MANIFEST_FORMAT_VERSION_V1,
 };
 use crate::sstable::table::Table;
 use crate::sstable::SstId;
@@ -145,7 +145,7 @@ impl LevelManifest {
 					manifest_id: 0,
 					levels,
 					hidden_set: HashSet::with_capacity(10),
-					manifest_format_version: MANIFEST_FORMAT_VERSION_V3,
+					manifest_format_version: MANIFEST_FORMAT_VERSION_V1,
 					snapshots: Vec::new(),
 					log_number: 0,
 					last_sequence: 0,

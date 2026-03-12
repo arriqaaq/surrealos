@@ -9,7 +9,7 @@ use std::sync::{Arc, RwLock};
 use crate::cloud_store::CloudStore;
 use crate::compaction::compactor::HiddenTablesGuard;
 use crate::levels::{Level, LevelManifest};
-use crate::manifest::{ManifestChangeSet, MANIFEST_FORMAT_VERSION_V3};
+use crate::manifest::{ManifestChangeSet, MANIFEST_FORMAT_VERSION_V1};
 use crate::sstable::table::TableWriter;
 use crate::sstable::SstId;
 use crate::test::{new_test_table, new_test_table_with_store, test_sst_id, test_table_store};
@@ -548,7 +548,7 @@ fn new_level_test_manifest(opts: &Arc<Options>) -> LevelManifest {
 		manifest_id: 0,
 		levels,
 		hidden_set: HashSet::with_capacity(10),
-		manifest_format_version: MANIFEST_FORMAT_VERSION_V3,
+		manifest_format_version: MANIFEST_FORMAT_VERSION_V1,
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
