@@ -187,8 +187,8 @@ impl Writer {
 		// Pad when there's not enough space for a header
 		if leftover < HEADER_SIZE {
 			// Pad remaining space with zeros (will be 1-6 bytes)
-			let padding = vec![0u8; leftover];
-			self.dest.append(&padding)?;
+			let padding = &[0u8; HEADER_SIZE][..leftover];
+			self.dest.append(padding)?;
 			self.block_offset = 0;
 		}
 
