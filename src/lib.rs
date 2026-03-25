@@ -685,8 +685,8 @@ impl InternalKey {
 
 	pub(crate) fn decode(encoded_key: &[u8]) -> Self {
 		let n = encoded_key.len() - 16; // 8 bytes for timestamp + 8 bytes for trailer
-		let trailer = read_u64_be(encoded_key, n);
-		let timestamp = read_u64_be(encoded_key, n + 8);
+		let timestamp = read_u64_be(encoded_key, n);
+		let trailer = read_u64_be(encoded_key, n + 8);
 		let user_key = encoded_key[..n].to_vec();
 
 		Self {
@@ -705,7 +705,7 @@ impl InternalKey {
 	/// Extract trailer (seq_num + kind) without allocation
 	#[inline]
 	pub(crate) fn trailer_from_encoded(encoded: &[u8]) -> u64 {
-		let n = encoded.len() - 16;
+		let n = encoded.len() - 8;
 		read_u64_be(encoded, n)
 	}
 
@@ -717,8 +717,8 @@ impl InternalKey {
 
 	pub(crate) fn encode(&self) -> Vec<u8> {
 		let mut buf = self.user_key.clone();
-		buf.extend_from_slice(&self.trailer.to_be_bytes());
 		buf.extend_from_slice(&self.timestamp.to_be_bytes());
+		buf.extend_from_slice(&self.trailer.to_be_bytes());
 		buf
 	}
 
@@ -817,7 +817,7 @@ impl<'a> InternalKeyRef<'a> {
 
 	#[inline]
 	pub fn timestamp(&self) -> u64 {
-		let n = self.encoded.len() - 8;
+		let n = self.encoded.len() - 16;
 		read_u64_be(self.encoded, n)
 	}
 

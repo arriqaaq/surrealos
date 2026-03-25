@@ -704,8 +704,8 @@ impl<'a> SkiplistIterator<'a> {
 		};
 		self.encoded_key_buf.clear();
 		self.encoded_key_buf.extend_from_slice(key_bytes);
-		self.encoded_key_buf.extend_from_slice(&trailer.to_be_bytes());
 		self.encoded_key_buf.extend_from_slice(&timestamp.to_be_bytes());
+		self.encoded_key_buf.extend_from_slice(&trailer.to_be_bytes());
 	}
 
 	/// Move to first entry within bounds
