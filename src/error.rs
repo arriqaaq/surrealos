@@ -181,7 +181,17 @@ pub enum ErrorSeverity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackgroundErrorReason {
 	Compaction,
+	MemtableFlush,
 	ManifestWrite,
+}
+
+/// Reason for a write stall
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteStallReason {
+	/// Too many immutable memtables pending flush
+	MemtableLimit,
+	/// Too many L0 files pending compaction
+	L0FileLimit,
 }
 
 /// Represents a background error with its severity and context

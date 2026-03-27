@@ -9,8 +9,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use crate::batch::Batch;
 use crate::cloud_store::CloudStore;
 use crate::commit::{CommitEnv, CommitPipeline};
-use crate::compaction::CompactionScheduler;
-#[cfg(test)]
+use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::CompactionStrategy;
 use crate::epoch::EpochManifest;
 use crate::error::{BackgroundErrorHandler, BackgroundErrorReason, Result};
@@ -26,6 +25,8 @@ use crate::memtable::{ImmutableEntry, ImmutableMemtables, MemTable};
 use crate::paths::StorePaths;
 use crate::snapshot::{Snapshot, SnapshotTracker};
 use crate::sstable::table::Table;
+use crate::stall::{StallCounts, StallThresholds, WriteStallController, WriteStallCountProvider};
+use crate::task::TaskManager;
 use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
 use crate::wal::{self, cleanup_old_segments, Wal, WalManager};
 use crate::{Comparator, Error, FilterPolicy, Options, Value, WalRecoveryMode};
@@ -106,9 +107,8 @@ pub(crate) struct CoreInner {
 	/// Shared with CommitPipeline for coordinated updates.
 	pub(crate) visible_seq_num: Arc<AtomicU64>,
 
-	/// Compaction scheduler driven from the commit path
-	/// Protected by tokio::Mutex since compact_beat() is async and needs &mut self.
-	pub(crate) compaction_scheduler: tokio::sync::Mutex<CompactionScheduler>,
+	/// Fencing state for compactor epoch tracking.
+	pub(crate) local_compactor_epoch: u64,
 
 	/// Central abstraction for SST reads/writes via object store.
 	pub(crate) table_store: Arc<CloudStore>,
@@ -321,16 +321,7 @@ impl CoreInner {
 			});
 		}
 
-		let compaction_scheduler = CompactionScheduler::new(
-			Arc::clone(&opts),
-			Arc::clone(&level_manifest),
-			Arc::clone(&immutable_memtables),
-			Arc::clone(&error_handler),
-			snapshot_tracker.clone(),
-			Arc::clone(&table_store),
-			Arc::clone(&manifest_uploader),
-			fencing.compactor_epoch(),
-		);
+		let local_compactor_epoch = fencing.compactor_epoch();
 
 		Ok(Self {
 			opts,
@@ -342,7 +333,7 @@ impl CoreInner {
 			lockfile: Mutex::new(lockfile),
 			error_handler,
 			visible_seq_num,
-			compaction_scheduler: tokio::sync::Mutex::new(compaction_scheduler),
+			local_compactor_epoch,
 			table_store,
 			manifest_uploader,
 			fencing,
@@ -897,12 +888,9 @@ impl CoreInner {
 		Ok(())
 	}
 
-	/// Runs compaction with the given strategy (test-only convenience method).
-	/// Creates a Compactor with real shared state and runs it.
-	#[cfg(test)]
-	pub(crate) async fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()> {
-		use crate::compaction::compactor::{CompactionOptions, Compactor};
-		let compaction_opts = CompactionOptions {
+	/// Build CompactionOptions from CoreInner state.
+	pub(crate) fn compaction_opts(&self) -> CompactionOptions {
+		CompactionOptions {
 			lopts: Arc::clone(&self.opts),
 			level_manifest: Arc::clone(&self.level_manifest),
 			immutable_memtables: Arc::clone(&self.immutable_memtables),
@@ -910,22 +898,87 @@ impl CoreInner {
 			snapshot_tracker: self.snapshot_tracker.clone(),
 			table_store: Arc::clone(&self.table_store),
 			manifest_uploader: Arc::clone(&self.manifest_uploader),
-			local_compactor_epoch: self.fencing.compactor_epoch(),
+			local_compactor_epoch: self.local_compactor_epoch,
 			branching_enabled: self.opts.branch_name.is_some(),
-		};
-		let compactor = Compactor::new(compaction_opts, strategy);
+		}
+	}
+
+	pub(crate) fn immutable_count(&self) -> usize {
+		self.immutable_memtables.read().map(|imm| imm.iter().count()).unwrap_or(0)
+	}
+
+	pub(crate) fn l0_file_count(&self) -> usize {
+		self.level_manifest
+			.read()
+			.map(|m| m.levels.get_levels().first().map(|l| l.tables.len()).unwrap_or(0))
+			.unwrap_or(0)
+	}
+}
+
+// ===== Compaction Operations Trait =====
+/// Defines the compaction operations that can be performed on an LSM tree.
+/// Compaction is essential for maintaining read performance by merging
+/// overlapping SSTables and removing deleted entries.
+#[async_trait::async_trait]
+pub trait CompactionOperations: Send + Sync {
+	/// Flushes the oldest immutable memtable to disk.
+	/// Returns Ok(true) if a memtable was flushed, Ok(false) if queue was empty.
+	async fn compact_memtable(&self) -> Result<bool>;
+
+	/// Performs compaction according to the specified strategy.
+	/// Compaction merges SSTables to reduce read amplification and remove
+	/// tombstones.
+	async fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()>;
+
+	/// Returns a reference to the background error handler
+	fn error_handler(&self) -> Arc<crate::error::BackgroundErrorHandler>;
+
+	/// Returns true if there are immutable memtables pending flush.
+	fn has_pending_immutables(&self) -> bool;
+}
+
+#[async_trait::async_trait]
+impl CompactionOperations for CoreInner {
+	async fn compact_memtable(&self) -> Result<bool> {
+		Ok(self.flush_oldest_immutable_to_sst().await?.is_some())
+	}
+
+	async fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()> {
+		let compactor = Compactor::new(self.compaction_opts(), strategy);
 		compactor.compact().await
+	}
+
+	fn error_handler(&self) -> Arc<crate::error::BackgroundErrorHandler> {
+		Arc::clone(&self.error_handler)
+	}
+
+	fn has_pending_immutables(&self) -> bool {
+		self.immutable_count() > 0
+	}
+}
+
+impl WriteStallCountProvider for CoreInner {
+	fn get_stall_counts(&self) -> StallCounts {
+		StallCounts {
+			immutable_memtables: self.immutable_count(),
+			l0_files: self.l0_file_count(),
+		}
 	}
 }
 
 struct LsmCommitEnv {
 	core: Arc<CoreInner>,
+
+	/// Manages background tasks like flushing and compaction
+	task_manager: Option<Arc<TaskManager>>,
 }
 
 impl LsmCommitEnv {
-	pub(crate) fn new(core: Arc<CoreInner>) -> Result<Self> {
+	/// Creates a new commit environment for the LSM tree
+	pub(crate) fn new(core: Arc<CoreInner>, task_manager: Arc<TaskManager>) -> Result<Self> {
 		Ok(Self {
 			core,
+			task_manager: Some(task_manager),
 		})
 	}
 }
@@ -973,13 +1026,9 @@ impl CommitEnv for LsmCommitEnv {
 
 				self.core.rotate_memtable()?;
 
-				// Flush immutable memtables synchronously (commit-path compaction)
-				self.core.flush_all_immutables_sync().await?;
-
-				// Run one beat of compaction
-				{
-					let mut scheduler = self.core.compaction_scheduler.lock().await;
-					scheduler.compact_beat().await?;
+				// Schedule background flush
+				if let Some(ref task_manager) = self.task_manager {
+					task_manager.wake_up_memtable();
 				}
 
 				// Retry on new memtable - must succeed
@@ -1009,6 +1058,13 @@ pub(crate) struct Core {
 
 	/// The commit pipeline that handles write batches
 	pub(crate) commit_pipeline: Arc<CommitPipeline>,
+
+	/// Task manager for background operations (stored in Option so we can take
+	/// it for shutdown)
+	pub(crate) task_manager: Mutex<Option<Arc<TaskManager>>>,
+
+	/// Write stall controller for backpressure management
+	pub(crate) write_stall: Arc<WriteStallController>,
 }
 
 impl std::ops::Deref for Core {
@@ -1146,10 +1202,32 @@ impl Core {
 
 		let inner = Arc::new(CoreInner::new(Arc::clone(&opts)).await?);
 
-		let commit_env = Arc::new(LsmCommitEnv::new(Arc::clone(&inner))?);
+		// Create the write stall controller with the provider and thresholds
+		let thresholds = StallThresholds {
+			memtable_limit: opts.memtable_stall_threshold,
+			l0_file_limit: opts.l0_stall_threshold,
+		};
+		let write_stall = Arc::new(WriteStallController::new(
+			Arc::clone(&inner) as Arc<dyn WriteStallCountProvider>,
+			thresholds,
+		));
+
+		// Initialize background task manager
+		let task_manager = Arc::new(TaskManager::new(
+			Arc::clone(&inner) as Arc<dyn CompactionOperations>,
+			Arc::clone(&opts),
+			Arc::clone(&write_stall),
+		));
+
+		let commit_env =
+			Arc::new(LsmCommitEnv::new(Arc::clone(&inner), Arc::clone(&task_manager))?);
 
 		// Pass the shared visible_seq_num from CoreInner to CommitPipeline
-		let commit_pipeline = CommitPipeline::new(commit_env, Arc::clone(&inner.visible_seq_num));
+		let commit_pipeline = CommitPipeline::new(
+			commit_env,
+			Arc::clone(&inner.visible_seq_num),
+			Arc::clone(&write_stall),
+		);
 
 		// Path for the WAL directory
 		let wal_path = opts.wal_dir();
@@ -1234,15 +1312,14 @@ impl Core {
 		// but BEFORE any new flushes that might create new SSTs
 		inner.cleanup_orphaned_sst_files().await?;
 
-		// Run initial compaction check at startup
-		{
-			let mut scheduler = inner.compaction_scheduler.lock().await;
-			let _ = scheduler.compact_beat().await;
-		}
+		// Trigger level compaction check at startup
+		task_manager.wake_up_level();
 
 		let core = Self {
 			inner: Arc::clone(&inner),
 			commit_pipeline: Arc::clone(&commit_pipeline),
+			task_manager: Mutex::new(Some(task_manager)),
+			write_stall,
 		};
 
 		log::info!("=== LSM tree initialization complete ===");
@@ -1291,6 +1368,18 @@ impl Core {
 		// Step 1: Shutdown the commit pipeline to stop accepting new writes
 		self.commit_pipeline.shutdown();
 		log::debug!("Commit pipeline shutdown complete");
+
+		// Step 2: Signal write stall controller - wake any stalled writers
+		self.write_stall.signal_shutdown();
+		log::debug!("Write stall shutdown signal sent");
+
+		// Step 3: Wait for and stop all background tasks
+		let task_manager = self.task_manager.lock().unwrap().take();
+		if let Some(task_manager) = task_manager {
+			log::debug!("Stopping background task manager...");
+			task_manager.stop().await;
+			log::debug!("Background task manager stopped");
+		}
 
 		// Step 2: Conditionally flush ALL memtables based on flush_on_close option
 		// CRITICAL ORDERING: Immutable memtables must be flushed BEFORE active memtable

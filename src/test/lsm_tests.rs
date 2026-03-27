@@ -5235,7 +5235,8 @@ async fn test_range_scan_after_compaction() {
 	tree.flush().await.unwrap();
 
 	// Phase 3: Verify range scans match model
-	let test_ranges: Vec<(Option<&[u8]>, Option<&[u8]>)> = vec![
+	type RangeSpec<'a> = (Option<&'a [u8]>, Option<&'a [u8]>);
+	let test_ranges: Vec<RangeSpec<'_>> = vec![
 		(None, None),                             // Full range
 		(Some(b"key_00000"), Some(b"key_00075")), // First quarter
 		(Some(b"key_00100"), Some(b"key_00200")), // Middle
@@ -5384,7 +5385,7 @@ async fn test_branch_data_isolation_fuzz() {
 		let parent_val = parent.get(&key).await.unwrap().unwrap();
 		assert_eq!(
 			&parent_val[..],
-			model_main.get(&key).unwrap().as_slice(),
+			model_main[&key].as_slice(),
 			"Parent value corrupted for key_{:04}",
 			i
 		);
@@ -5430,7 +5431,7 @@ async fn test_branch_data_isolation_fuzz() {
 		);
 		assert_eq!(
 			value,
-			*model_feature.get(&key).unwrap(),
+			model_feature[&key],
 			"Feature scan value mismatch for key: {:?}",
 			String::from_utf8_lossy(&key)
 		);

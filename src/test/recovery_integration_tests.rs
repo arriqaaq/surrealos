@@ -784,7 +784,7 @@ async fn test_multi_cycle_recovery_fuzz() {
 		for _ in 0..check_count {
 			let idx = rng.usize(0..model_keys.len());
 			let key = &model_keys[idx];
-			let expected = model.get(key).unwrap();
+			let expected = &model[key];
 			let actual = tree2.get(key).await.unwrap();
 			assert_eq!(
 				actual.as_deref(),

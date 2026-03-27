@@ -228,6 +228,7 @@ impl LevelManifest {
 	}
 
 	/// Move a table from source level to target level without merge.
+	#[cfg(test)]
 	pub(crate) fn move_table(
 		&mut self,
 		source_level: u8,

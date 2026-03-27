@@ -608,7 +608,7 @@ async fn test_level_hide_unhide_fuzz() {
 		if op < 30 {
 			// HIDE: pick 1-3 random non-hidden table IDs
 			let visible: Vec<_> =
-				all_ids.iter().filter(|id| !model_hidden.contains(id)).cloned().collect();
+				all_ids.iter().filter(|id| !model_hidden.contains(id)).copied().collect();
 			if visible.is_empty() {
 				continue;
 			}
@@ -621,7 +621,7 @@ async fn test_level_hide_unhide_fuzz() {
 			}
 		} else if op < 60 {
 			// UNHIDE: pick 1-3 random hidden table IDs
-			let hidden: Vec<_> = model_hidden.iter().cloned().collect();
+			let hidden: Vec<_> = model_hidden.iter().copied().collect();
 			if hidden.is_empty() {
 				continue;
 			}

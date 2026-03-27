@@ -1,26 +1,18 @@
-#[cfg(test)]
 use std::fs::File as SysFile;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use crate::cloud_store::CloudStore;
-use crate::compaction::CompactionInput;
-#[cfg(test)]
-use crate::compaction::{CompactionChoice, CompactionStrategy};
+use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::error::{BackgroundErrorHandler, Result};
-#[cfg(test)]
 use crate::iter::{BoxedLSMIterator, CompactionIterator};
 use crate::levels::LevelManifest;
 use crate::manifest::{write_manifest_to_disk, ManifestChangeSet, ManifestUploader};
 use crate::memtable::ImmutableMemtables;
 use crate::snapshot::SnapshotTracker;
-use crate::sstable::table::Table;
-#[cfg(test)]
-use crate::sstable::table::TableWriter;
+use crate::sstable::table::{Table, TableWriter};
 use crate::sstable::SstId;
-#[cfg(test)]
-use crate::Comparator;
-use crate::Options as LSMOptions;
+use crate::{Comparator, Options as LSMOptions};
 
 /// RAII guard to ensure tables are unhidden if compaction fails
 pub(crate) struct HiddenTablesGuard {
@@ -78,15 +70,10 @@ pub(crate) struct CompactionOptions {
 }
 
 // ============================================================================
-// Shared helpers used by both Compactor (run-to-completion) and LiveCompaction
-// (beat-spread). These are free functions to avoid coupling to either struct.
+// Shared helpers
 // ============================================================================
 
 /// Upload a locally-written SST file to the object store, then open it.
-///
-/// Compaction writes to a local file via `TableWriter<SysFile>`. Once `writer.finish()`
-/// completes, this function reads the file, uploads it to the object store, removes the
-/// local copy, and opens the table from the object store.
 pub(crate) async fn upload_and_open_table(
 	lopts: &Arc<LSMOptions>,
 	table_id: SstId,
@@ -167,10 +154,6 @@ pub(crate) fn update_manifest(
 }
 
 /// Remove old table files after successful manifest update.
-///
-/// When `branching_enabled` is true, only removes from the local SST cache —
-/// object store deletion is deferred to the cross-branch purger to avoid
-/// deleting SSTs still referenced by other branches.
 pub(crate) async fn cleanup_old_tables(
 	table_store: &Arc<CloudStore>,
 	input: &CompactionInput,
@@ -190,15 +173,16 @@ pub(crate) async fn cleanup_old_tables(
 	}
 }
 
-/// Handles the compaction state and operations (run-to-completion mode).
-/// Used by tests for direct compaction without beat scheduling.
-#[cfg(test)]
+// ============================================================================
+// Compactor: run-to-completion compaction
+// ============================================================================
+
+/// Handles the compaction state and operations
 pub(crate) struct Compactor {
 	pub(crate) options: CompactionOptions,
 	pub(crate) strategy: Arc<dyn CompactionStrategy>,
 }
 
-#[cfg(test)]
 impl Compactor {
 	pub(crate) fn new(options: CompactionOptions, strategy: Arc<dyn CompactionStrategy>) -> Self {
 		Self {
@@ -215,24 +199,6 @@ impl Compactor {
 
 		match choice {
 			CompactionChoice::Merge(input) => self.merge_tables(&input).await,
-			CompactionChoice::Move(input) => {
-				let mut levels_guard = self.options.level_manifest.write()?;
-				// Move-table optimization: just relocate metadata, no merge needed.
-				assert_eq!(input.tables_to_merge.len(), 1, "Move expects exactly one table");
-				let table_id = input.tables_to_merge[0];
-
-				levels_guard.move_table(input.source_level, input.target_level, table_id)?;
-				let bytes = write_manifest_to_disk(&mut levels_guard)?;
-				self.options.manifest_uploader.queue_upload(levels_guard.manifest_id, bytes);
-
-				log::debug!(
-					"Move-table: L{} → L{}, table_id={}",
-					input.source_level,
-					input.target_level,
-					table_id
-				);
-				Ok(())
-			}
 			CompactionChoice::Skip => Ok(()),
 		}
 	}
@@ -320,8 +286,6 @@ impl Compactor {
 			TableWriter::new(file, table_id, Arc::clone(&self.options.lopts), input.target_level);
 
 		// Get active snapshots for snapshot-aware compaction
-		// This is a snapshot of the snapshot list at the start of compaction.
-		// Any snapshots created during compaction will be handled by the next compaction.
 		let snapshots = self.options.snapshot_tracker.get_all_snapshots();
 
 		// Create a compaction iterator that filters tombstones and respects snapshots

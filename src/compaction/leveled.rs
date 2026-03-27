@@ -57,15 +57,6 @@ impl Strategy {
 		}
 	}
 
-	/// Create a Strategy that only compacts from a specific source level.
-	/// Used by the beat/bar scheduler to target individual levels per half-bar.
-	pub(crate) fn with_target_level(opts: Arc<Options>, source_level: u8) -> TargetedStrategy {
-		TargetedStrategy {
-			source_level,
-			inner: Self::from_options(opts),
-		}
-	}
-
 	/// Create a Strategy from Options with a specific compaction priority
 	#[cfg(test)]
 	pub(crate) fn from_options_with_priority(
@@ -122,33 +113,6 @@ impl Strategy {
 	}
 
 	/// Expand file selection to include all files sharing boundary user keys.
-	/// This will be useful later when we compact based on a size limit where
-	/// there could be multiple tables that overlap with the same user key range.
-	///
-	/// # Example
-	///
-	/// Given L1 with 4 files:
-	///
-	/// File 1: [a -------- b]
-	/// File 2:             [b -------- c]   ← shares "b" with File 1
-	/// File 3:                         [c -------- d]   ← shares "c" with File 2
-	/// File 4:                                     [e -------- f]   ← isolated (gap before "e")
-	/// ///
-	/// If we start with `initial_table_id = 2` (File 2):
-	///
-	/// **Iteration 1:**
-	/// - Selected: {2}, combined range: [b, c]
-	/// - File 1 [a,b]: a <= c ✓ AND b >= b ✓ → overlaps (shares "b") → add
-	/// - File 3 [c,d]: c <= c ✓ AND d >= b ✓ → overlaps (shares "c") → add
-	/// - File 4 [e,f]: e <= c ✗ → no overlap → skip
-	/// - Selected: {1, 2, 3}
-	///
-	/// **Iteration 2:**
-	/// - Selected: {1, 2, 3}, combined range: [a, d]
-	/// - File 4 [e,f]: e <= d ✗ → no overlap → skip
-	/// - No new files added
-	///
-	/// **Result:** {1, 2, 3} - File 4 excluded due to clean gap between "d" and "e"
 	pub(crate) fn select_overlapping_ranges(
 		level: &Level,
 		initial_table_id: SstId,
@@ -166,12 +130,11 @@ impl Strategy {
 			let old_size = selected_ids.len();
 
 			// Get combined key range of all currently selected tables
-			// This range may grow as we add more tables
 			let range = match Self::combined_key_range(
 				level.tables.iter().filter(|t| selected_ids.contains(&t.id)),
 			) {
 				Some(r) => r,
-				None => break, // No bounds available
+				None => break,
 			};
 
 			// Find all tables that overlap with the combined range
@@ -185,7 +148,6 @@ impl Strategy {
 			if selected_ids.len() == old_size {
 				break;
 			}
-			// Otherwise, loop again with the expanded range to catch transitive overlaps
 		}
 
 		Ok(selected_ids.into_iter().collect())
@@ -294,8 +256,6 @@ impl Strategy {
 			});
 		}
 
-		// Sort by oldest smallest sequence number first, then by file size (larger
-		// first)
 		choices.sort_by(|a, b| match a.smallest_seq.cmp(&b.smallest_seq) {
 			std::cmp::Ordering::Equal => b.file_size.cmp(&a.file_size),
 			ordering => ordering,
@@ -330,8 +290,6 @@ impl Strategy {
 			});
 		}
 
-		// Sort by oldest largest sequence number first (coldest ranges), then by file
-		// size
 		choices.sort_by(|a, b| match a.largest_seq.cmp(&b.largest_seq) {
 			std::cmp::Ordering::Equal => b.file_size.cmp(&a.file_size),
 			ordering => ordering,
@@ -359,8 +317,6 @@ impl Strategy {
 			let num_entries = source_table.meta.properties.num_entries;
 			let num_deletions = source_table.meta.properties.num_deletions;
 
-			// Calculate compensated size:
-			// Base file size, adjusted upward by delete ratio
 			let compensated_size = if num_entries > 0 && num_deletions > 0 {
 				let delete_ratio = num_deletions as f64 / num_entries as f64;
 				file_size as f64 * (1.0 + delete_ratio * 0.5)
@@ -374,7 +330,6 @@ impl Strategy {
 			});
 		}
 
-		// Sort by compensated size (descending)
 		choices.sort_by(|a, b| {
 			b.compensated_size.partial_cmp(&a.compensated_size).unwrap_or(std::cmp::Ordering::Equal)
 		});
@@ -383,8 +338,6 @@ impl Strategy {
 	}
 
 	/// Compute compaction scores for all levels
-	/// Returns vector of (level, score) pairs sorted by score descending
-	/// Only includes levels with score >= 1.0
 	fn compute_compaction_scores(&self, manifest: &LevelManifest) -> Vec<(u8, f64)> {
 		let levels = manifest.levels.get_levels();
 		let mut scores = Vec::new();
@@ -419,12 +372,10 @@ impl Strategy {
 	pub(crate) fn find_compaction_level(&self, manifest: &LevelManifest) -> Option<u8> {
 		let scores = self.compute_compaction_scores(manifest);
 
-		// No levels need compaction
 		if scores.is_empty() {
 			return None;
 		}
 
-		// Pick the level with the highest score
 		let (level, _score) = scores[0];
 		Some(level)
 	}
@@ -454,81 +405,6 @@ impl CompactionStrategy for Strategy {
 
 		if tables_to_merge.is_empty() {
 			return Ok(CompactionChoice::Skip);
-		}
-
-		Ok(CompactionChoice::Merge(CompactionInput {
-			tables_to_merge,
-			source_level,
-			target_level,
-		}))
-	}
-}
-
-/// A strategy that only compacts from a specific source level.
-/// Used by the beat/bar scheduler to target individual levels per half-bar
-pub(crate) struct TargetedStrategy {
-	source_level: u8,
-	inner: Strategy,
-}
-
-impl CompactionStrategy for TargetedStrategy {
-	fn pick_levels(&self, manifest: &LevelManifest) -> Result<CompactionChoice> {
-		let levels = manifest.levels.get_levels();
-		let source_level = self.source_level;
-
-		if source_level as usize >= levels.len() {
-			return Ok(CompactionChoice::Skip);
-		}
-
-		// Check if this level needs compaction
-		let needs_compaction = if source_level == 0 {
-			// L0: trigger based on file count
-			levels[0].tables.len() >= self.inner.level0_file_num_trigger
-		} else {
-			// L1+: trigger based on size ratio
-			let bytes = Strategy::level_bytes(&levels[source_level as usize]);
-			let target = self.inner.target_bytes_for_level(source_level);
-			target > 0 && bytes as f64 / target as f64 >= 1.0
-		};
-
-		if !needs_compaction {
-			return Ok(CompactionChoice::Skip);
-		}
-
-		// Allow same-level compaction at the bottom level for tombstone cleanup
-		let target_level = if source_level >= manifest.last_level_index() {
-			source_level
-		} else {
-			source_level + 1
-		};
-
-		let tables_to_merge = self.inner.select_tables_for_compaction(
-			&levels[source_level as usize],
-			&levels[target_level as usize],
-			source_level,
-		)?;
-
-		if tables_to_merge.is_empty() {
-			return Ok(CompactionChoice::Skip);
-		}
-
-		// Check for move-table optimization.
-		// For L1+ with a single selected source table, if all tables_to_merge are from the
-		// source level only (no target-level overlap), we can just move the table metadata.
-		if source_level > 0 && source_level != target_level {
-			let best_table =
-				self.inner.select_best_table_for_compaction(&levels[source_level as usize]);
-			if let Some(table_id) = best_table {
-				// If the only table in tables_to_merge is the source table itself,
-				// it means there's no overlap in the target level
-				if tables_to_merge.len() == 1 && tables_to_merge[0] == table_id {
-					return Ok(CompactionChoice::Move(CompactionInput {
-						tables_to_merge: vec![table_id],
-						source_level,
-						target_level,
-					}));
-				}
-			}
 		}
 
 		Ok(CompactionChoice::Merge(CompactionInput {

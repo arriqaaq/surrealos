@@ -1840,7 +1840,7 @@ async fn test_manifest_changeset_fuzz() {
 			if model.is_empty() {
 				continue;
 			}
-			let keys: Vec<_> = model.keys().cloned().collect();
+			let keys: Vec<_> = model.keys().copied().collect();
 			let idx = rng.usize(0..keys.len());
 			let (level, table_id) = keys[idx];
 
@@ -1983,7 +1983,7 @@ async fn test_manifest_changeset_fuzz() {
 		}
 	}
 
-	let model_keys: std::collections::BTreeSet<_> = model.keys().cloned().collect();
+	let model_keys: std::collections::BTreeSet<_> = model.keys().copied().collect();
 	assert_eq!(loaded_tables, model_keys, "Final manifest does not match model");
 }
 

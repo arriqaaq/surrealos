@@ -19,6 +19,8 @@ mod memtable;
 mod paths;
 mod snapshot;
 mod sstable;
+pub(crate) mod stall;
+pub(crate) mod task;
 mod vfs;
 mod wal;
 
@@ -191,11 +193,13 @@ pub struct Options {
 	/// Default: 10.0
 	pub level_multiplier: f64,
 
-	/// Number of beats per compaction bar.
-	/// Each commit advances one beat. A bar is one full compaction cycle.
-	/// Levels alternate between half-bars: odd targets in first half, even in second.
-	/// Default: 32
-	pub compaction_beats_per_bar: u64,
+	// Write stall thresholds
+	/// Maximum immutable memtable count before stalling writes.
+	/// Default: 2
+	pub memtable_stall_threshold: usize,
+	/// Maximum L0 file count before stalling writes.
+	/// Default: 12
+	pub l0_stall_threshold: usize,
 
 	// Object store configuration
 	/// Object store for SSTs and manifest. Default: in-memory store.
@@ -261,7 +265,8 @@ impl Default for Options {
 			level0_max_files: 4,
 			max_bytes_for_level: 256 * 1024 * 1024, // 256MB
 			level_multiplier: 10.0,
-			compaction_beats_per_bar: crate::compaction::DEFAULT_BEATS_PER_BAR,
+			memtable_stall_threshold: 2,
+			l0_stall_threshold: 12,
 			object_store: Arc::new(object_store::memory::InMemory::new()),
 			object_store_root: String::new(),
 			max_sst_size: 64 * 1024 * 1024, // 64MB

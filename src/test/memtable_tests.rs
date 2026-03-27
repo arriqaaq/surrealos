@@ -827,22 +827,22 @@ async fn test_memtable_dedup_across_sequences() {
 
 	// Batch 1: set k1=v1 at seq=1
 	let mut batch1 = Batch::new_with_seq(1);
-	batch1.set(b"k1".to_vec(), b"v1".to_vec()).unwrap();
+	batch1.set(b"k1", b"v1").unwrap();
 	memtable.add(&batch1).unwrap();
 
 	// Batch 2: set k1=v2 at seq=2 (newer version)
 	let mut batch2 = Batch::new_with_seq(2);
-	batch2.set(b"k1".to_vec(), b"v2".to_vec()).unwrap();
+	batch2.set(b"k1", b"v2").unwrap();
 	memtable.add(&batch2).unwrap();
 
 	// Batch 3: delete k1 at seq=3 (tombstone)
 	let mut batch3 = Batch::new_with_seq(3);
-	batch3.delete(b"k1".to_vec()).unwrap();
+	batch3.delete(b"k1").unwrap();
 	memtable.add(&batch3).unwrap();
 
 	// Batch 4: set k1=v3 at seq=4 (resurrection)
 	let mut batch4 = Batch::new_with_seq(4);
-	batch4.set(b"k1".to_vec(), b"v3".to_vec()).unwrap();
+	batch4.set(b"k1", b"v3").unwrap();
 	memtable.add(&batch4).unwrap();
 
 	// Verify via iterator: should see all 4 versions in seq desc order
