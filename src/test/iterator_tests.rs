@@ -95,6 +95,7 @@ async fn test_merge_iterator_sequence_ordering() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![],
+		None,
 	);
 
 	// Collect all items
@@ -173,6 +174,7 @@ async fn test_compaction_iterator_hard_delete_filtering() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![],
+		None,
 	);
 
 	// Collect all items
@@ -246,6 +248,7 @@ async fn test_compaction_iterator_hard_delete_filtering() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![],
+		None,
 	);
 
 	// Collect all items
@@ -299,6 +302,7 @@ async fn test_combined_iterator_returns_latest_version() {
 		0,
 		Arc::new(MockLogicalClock::default()),
 		vec![],
+		None,
 	);
 
 	// Should return only the latest version (seq=300)
@@ -346,6 +350,7 @@ async fn test_combined_iterator_adds_older_versions_to_delete_list() {
 		0,
 		Arc::new(MockLogicalClock::default()),
 		vec![],
+		None,
 	);
 
 	// Consume the iterator
@@ -387,6 +392,7 @@ async fn test_hard_delete_at_bottom_level() {
 		0,
 		Arc::new(MockLogicalClock::default()),
 		vec![],
+		None,
 	);
 
 	// At bottom level, hard_delete should NOT be returned
@@ -420,6 +426,7 @@ async fn test_hard_delete_at_non_bottom_level() {
 		0,
 		Arc::new(MockLogicalClock::default()),
 		vec![],
+		None,
 	);
 
 	// At non-bottom level, hard_delete SHOULD be returned
@@ -472,6 +479,7 @@ async fn test_multiple_keys_with_mixed_scenarios() {
 		0,
 		Arc::new(MockLogicalClock::default()),
 		vec![],
+		None,
 	);
 
 	let mut result = Vec::new();
@@ -528,6 +536,7 @@ async fn test_no_delete_list() {
 		0,
 		Arc::new(MockLogicalClock::default()),
 		vec![],
+		None,
 	);
 
 	// Should still work and return latest version
@@ -591,6 +600,7 @@ async fn test_sequence_ordering_across_iterators() {
 		0,
 		Arc::new(MockLogicalClock::default()),
 		vec![],
+		None,
 	);
 
 	let mut result = Vec::new();
@@ -703,6 +713,7 @@ async fn test_compaction_iterator_versioning_retention_logic() {
 		retention_period_ns,
 		clock,
 		vec![],
+		None,
 	);
 
 	let mut result = Vec::new();
@@ -834,6 +845,7 @@ async fn test_compaction_iterator_versioning_retention_bottom_level() {
 		retention_period_ns,
 		clock,
 		vec![],
+		None,
 	);
 
 	let mut result = Vec::new();
@@ -948,6 +960,7 @@ async fn test_compaction_iterator_no_versioning_non_bottom_level() {
 		retention_period_ns,
 		clock,
 		vec![],
+		None,
 	);
 
 	let mut result = Vec::new();
@@ -1055,6 +1068,7 @@ async fn test_compaction_iterator_no_versioning_bottom_level() {
 		retention_period_ns,
 		clock,
 		vec![],
+		None,
 	);
 
 	let mut result = Vec::new();
@@ -1301,6 +1315,7 @@ async fn test_snapshot_compaction_no_snapshots_keeps_only_latest() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![], // No snapshots
+		None,
 	);
 
 	let mut result = Vec::new();
@@ -1335,6 +1350,7 @@ async fn test_snapshot_compaction_single_snapshot_preserves_visible_version() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![50], // Snapshot at seq=50
+		None,
 	);
 
 	let mut result = Vec::new();
@@ -1378,6 +1394,7 @@ async fn test_snapshot_compaction_multiple_snapshots_different_boundaries() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![50, 150], // Two snapshots
+		None,
 	);
 
 	let mut result = Vec::new();
@@ -1425,6 +1442,7 @@ async fn test_snapshot_compaction_newer_version_hides_older_in_same_boundary() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![150], // Snapshot at seq=150
+		None,
 	);
 
 	let mut result = Vec::new();
@@ -1459,6 +1477,7 @@ async fn test_snapshot_compaction_versions_at_tip_hidden_by_newer() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![50], // Snapshot at seq=50
+		None,
 	);
 
 	let mut result = Vec::new();
@@ -1494,6 +1513,7 @@ async fn test_snapshot_compaction_multiple_keys() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![50], // Snapshot at seq=50
+		None,
 	);
 
 	let mut result = Vec::new();
@@ -1527,6 +1547,7 @@ async fn test_snapshot_compaction_tombstone_visible_to_snapshot() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![150],
+		None,
 	);
 
 	let mut result = Vec::new();
@@ -1564,6 +1585,7 @@ async fn test_snapshot_compaction_tombstone_at_bottom_with_snapshot() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![150],
+		None,
 	);
 
 	let mut result = Vec::new();
@@ -1596,6 +1618,7 @@ async fn test_snapshot_compaction_exact_sequence_match() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![50], // Snapshot at exact seq=50
+		None,
 	);
 
 	let mut result = Vec::new();
@@ -1632,6 +1655,7 @@ async fn test_snapshot_compaction_version_older_than_all_snapshots() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![50, 150],
+		None,
 	);
 
 	let mut result = Vec::new();
@@ -1660,6 +1684,7 @@ async fn test_snapshot_visibility_states() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![], // No snapshots
+		None,
 	);
 
 	// Test via the iterator behavior - with no snapshots, should keep only latest
@@ -1697,6 +1722,7 @@ async fn test_snapshot_compaction_with_versioning_enabled() {
 		300,   // retention period = 300ns
 		clock, // current time = 1000
 		vec![60],
+		None,
 	);
 
 	let mut result = Vec::new();

@@ -99,6 +99,16 @@ impl Batch {
 		self.add_record(InternalKeyKind::Delete, key.as_ref().to_vec(), None, timestamp)
 	}
 
+	/// Adds a merge operation to the batch.
+	pub fn merge(&mut self, key: impl AsRef<[u8]>, operand: impl AsRef<[u8]>) -> Result<()> {
+		self.add_record(
+			InternalKeyKind::Merge,
+			key.as_ref().to_vec(),
+			Some(operand.as_ref().to_vec()),
+			0,
+		)
+	}
+
 	/// Returns the number of entries in the batch.
 	pub fn len(&self) -> usize {
 		self.entries.len()

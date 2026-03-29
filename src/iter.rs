@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use crate::clock::LogicalClock;
 use crate::error::{Error, Result};
-use crate::{Comparator, InternalKey, InternalKeyRef, LSMIterator, Value};
+use crate::merge_operator::MergeOperator;
+use crate::{Comparator, InternalKey, InternalKeyKind, InternalKeyRef, LSMIterator, Value};
 
 // ============================================================================
 // SNAPSHOT VISIBILITY
@@ -755,6 +756,10 @@ pub(crate) struct CompactionIterator<'a> {
 	/// active snapshot must be preserved. The list is sorted in ascending
 	/// order for efficient binary search.
 	snapshots: Vec<u64>,
+
+	// ========== Merge Operator ==========
+	/// Optional merge operator for collapsing Merge entries during compaction.
+	merge_operator: Option<Arc<dyn MergeOperator>>,
 }
 
 impl<'a> CompactionIterator<'a> {
@@ -768,6 +773,7 @@ impl<'a> CompactionIterator<'a> {
 	/// * `retention_period_ns` - How long to keep old versions
 	/// * `clock` - Time source for retention calculations
 	/// * `snapshots` - Sorted list of active snapshot sequence numbers
+	/// * `merge_operator` - Optional merge operator for collapsing Merge entries
 	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new(
 		iterators: Vec<BoxedLSMIterator<'a>>,
@@ -777,6 +783,7 @@ impl<'a> CompactionIterator<'a> {
 		retention_period_ns: u64,
 		clock: Arc<dyn LogicalClock>,
 		snapshots: Vec<u64>,
+		merge_operator: Option<Arc<dyn MergeOperator>>,
 	) -> Self {
 		let merge_iter = MergingIterator::new(iterators, cmp);
 
@@ -791,6 +798,7 @@ impl<'a> CompactionIterator<'a> {
 			clock,
 			initialized: false,
 			snapshots,
+			merge_operator,
 		}
 	}
 
@@ -1005,6 +1013,149 @@ impl<'a> CompactionIterator<'a> {
 	/// Output: [seq=100, seq=50]
 	/// delete_list: [seq=20]
 	/// ```
+	/// Collapse Merge entries in `accumulated_versions` before the main
+	/// compaction filtering logic runs.
+	///
+	/// This processes the accumulated versions (already sorted by seq_num
+	/// descending) and collapses contiguous runs of Merge entries that are
+	/// in the same snapshot visibility boundary.
+	///
+	/// At the bottom level, a complete merge (with or without a base Set)
+	/// produces a Set entry. At non-bottom levels, a partial merge still
+	/// emits a Merge entry so that lower-level data can be incorporated
+	/// later.
+	fn collapse_merge_entries(&mut self) -> Result<()> {
+		let merge_op = match &self.merge_operator {
+			Some(op) => Arc::clone(op),
+			None => {
+				// No merge operator configured — check if any Merge entries exist.
+				let has_merge = self
+					.accumulated_versions
+					.iter()
+					.any(|(k, _)| k.kind() == InternalKeyKind::Merge);
+				if has_merge {
+					return Err(Error::MergeOperatorRequired);
+				}
+				return Ok(());
+			}
+		};
+
+		// Check if there are any merge entries at all; fast path out if not.
+		if !self.accumulated_versions.iter().any(|(k, _)| k.kind() == InternalKeyKind::Merge) {
+			return Ok(());
+		}
+
+		let user_key = self.current_user_key.clone();
+
+		// We process the list in seq_num-descending order (newest first).
+		// We need to identify contiguous groups within the same snapshot
+		// visibility boundary and collapse merge sequences within each group.
+		//
+		// A merge sequence is: [Merge, Merge, ..., (Set|Delete|end)]
+		// where all entries share the same visibility boundary.
+
+		let mut result: Vec<(InternalKey, Value)> = Vec::new();
+		let mut i = 0;
+		let versions = std::mem::take(&mut self.accumulated_versions);
+
+		while i < versions.len() {
+			let (ref key, _) = versions[i];
+
+			// If this is not a Merge entry, pass it through unchanged.
+			if key.kind() != InternalKeyKind::Merge {
+				result.push(versions[i].clone());
+				i += 1;
+				continue;
+			}
+
+			// Start of a Merge sequence. Collect contiguous Merge entries
+			// that share the same visibility boundary.
+			let first_merge_idx = i;
+			let first_vis = self.find_earliest_visible_snapshot(key.seq_num())?;
+
+			// Collect merge operands in this boundary (newest first).
+			let mut merge_operands_newest_first: Vec<&[u8]> = Vec::new();
+			merge_operands_newest_first.push(&versions[i].1);
+			i += 1;
+
+			while i < versions.len() {
+				let (ref next_key, ref next_val) = versions[i];
+				let next_vis = self.find_earliest_visible_snapshot(next_key.seq_num())?;
+
+				// If we cross a snapshot boundary, stop collecting.
+				if !self.same_visibility_boundary(first_vis, next_vis) {
+					break;
+				}
+
+				match next_key.kind() {
+					InternalKeyKind::Merge => {
+						merge_operands_newest_first.push(next_val);
+						i += 1;
+					}
+					InternalKeyKind::Set => {
+						// Found a base value — full_merge.
+						// Operands need to be oldest-first for the merge call.
+						merge_operands_newest_first.reverse();
+						let merged = merge_op.full_merge(
+							&user_key,
+							next_val,
+							&merge_operands_newest_first,
+						)?;
+						// Emit as Set with the highest seq_num from the sequence.
+						let merged_key = InternalKey::new(
+							versions[first_merge_idx].0.user_key.clone(),
+							versions[first_merge_idx].0.seq_num(),
+							InternalKeyKind::Set,
+							versions[first_merge_idx].0.timestamp,
+						);
+						result.push((merged_key, merged));
+						i += 1; // consume the Set entry
+			  // Break out of the merge sequence; remaining entries
+			  // in the same key continue in the outer loop.
+						merge_operands_newest_first.clear();
+						break;
+					}
+					_ => {
+						// Delete or other entry — stops the merge sequence.
+						// We do NOT consume this entry; it goes back through
+						// the outer loop.
+						break;
+					}
+				}
+			}
+
+			// If we still have operands (no base Set found), partial_merge.
+			if !merge_operands_newest_first.is_empty() {
+				merge_operands_newest_first.reverse(); // oldest-first
+				let merged = merge_op.partial_merge(&user_key, &merge_operands_newest_first)?;
+
+				if self.is_bottom_level {
+					// Bottom level: emit as Set (no more data below).
+					let merged_key = InternalKey::new(
+						versions[first_merge_idx].0.user_key.clone(),
+						versions[first_merge_idx].0.seq_num(),
+						InternalKeyKind::Set,
+						versions[first_merge_idx].0.timestamp,
+					);
+					result.push((merged_key, merged));
+				} else {
+					// Non-bottom level: emit as Merge so lower levels
+					// can provide a base value during later compactions.
+					let merged_key = InternalKey::new(
+						versions[first_merge_idx].0.user_key.clone(),
+						versions[first_merge_idx].0.seq_num(),
+						InternalKeyKind::Merge,
+						versions[first_merge_idx].0.timestamp,
+					);
+					result.push((merged_key, merged));
+				}
+			}
+		}
+
+		self.accumulated_versions = result;
+		Ok(())
+	}
+
 	fn process_accumulated_versions(&mut self) -> Result<()> {
 		if self.accumulated_versions.is_empty() {
 			return Ok(());
@@ -1013,6 +1164,9 @@ impl<'a> CompactionIterator<'a> {
 		// Sort by sequence number (descending) to get the latest version first
 		// Higher sequence number = more recent write
 		self.accumulated_versions.sort_by_key(|b| std::cmp::Reverse(b.0.seq_num()));
+
+		// Collapse Merge entries before applying the standard compaction logic.
+		self.collapse_merge_entries()?;
 
 		// Check if latest version is DELETE at bottom level
 		// If so, we can completely remove this key from the database
@@ -1088,7 +1242,7 @@ impl<'a> CompactionIterator<'a> {
 				// Required by snapshot: an active snapshot needs this version - keep it
 				false
 			} else if is_latest && !is_delete {
-				// Latest SET: never stale (will be output)
+				// Latest SET or Merge: never stale (will be output)
 				false
 			} else if is_latest && is_delete && self.is_bottom_level {
 				// Latest DELETE at bottom: stale (won't be output)
@@ -1100,7 +1254,7 @@ impl<'a> CompactionIterator<'a> {
 				// Older DELETE: always stale (only latest tombstone matters)
 				true
 			} else {
-				// Older PUT: check versioning and retention
+				// Older PUT/Merge: check versioning and retention
 				if !self.enable_versioning {
 					// No versioning enabled: only the latest version matters,
 					// all older versions are stale

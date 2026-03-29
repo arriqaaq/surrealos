@@ -60,6 +60,7 @@ pub enum Error {
 	ManifestVersionExists, // CAS failed: manifest version already written by another writer
 	ObjectStoreError(String), // Object store operation failed
 	InvalidDeletion,       // Attempted to delete active manifest
+	MergeOperatorRequired, // Merge entry encountered but no merge operator configured
 }
 
 // Implementation of Display trait for Error
@@ -110,6 +111,7 @@ impl fmt::Display for Error {
             Self::ManifestVersionExists => write!(f, "Manifest version already exists (CAS conflict)"),
             Self::ObjectStoreError(err) => write!(f, "Object store error: {err}"),
             Self::InvalidDeletion => write!(f, "Attempted to delete active manifest"),
+            Self::MergeOperatorRequired => write!(f, "Merge entry encountered but no merge operator is configured"),
         }
 	}
 }

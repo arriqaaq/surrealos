@@ -117,6 +117,60 @@ fn sst_age(id: &SstId) -> Duration {
 	Duration::from_millis(now_ms.saturating_sub(ts_ms))
 }
 
+/// Delete manifests older than the latest `keep_count`.
+///
+/// Lists all manifests (sorted ascending by ID), keeps the most recent
+/// `keep_count`, and deletes the rest. Returns the number of manifests deleted.
+pub(crate) async fn purge_old_manifests(store: &CloudStore, keep_count: usize) -> Result<usize> {
+	let ids = store.list_manifest_ids().await?; // Already sorted ascending
+	if ids.len() <= keep_count {
+		return Ok(0);
+	}
+	let to_delete = &ids[..ids.len() - keep_count];
+	let mut deleted = 0;
+	for &id in to_delete {
+		if let Err(e) = store.delete_manifest(id).await {
+			log::warn!("Failed to delete manifest {}: {}", id, e);
+		} else {
+			deleted += 1;
+		}
+	}
+	if deleted > 0 {
+		log::info!("Purged {} old manifest files from object store", deleted);
+	}
+	Ok(deleted)
+}
+
+/// For non-branching mode: purge SSTs not in current manifest.
+///
+/// Collects the live SST set from the manifest (synchronously), then lists
+/// all SSTs in the object store and deletes orphaned ones older than
+/// `MIN_PURGE_AGE` (based on ULID timestamp).
+///
+/// The `live_ssts` parameter should be obtained from
+/// `LevelManifest::get_all_tables().keys()` under a read lock before calling
+/// this function, so the lock is not held across await points.
+pub(crate) async fn purge_orphaned_ssts_simple(
+	store: &CloudStore,
+	live_ssts: &HashSet<SstId>,
+) -> Result<usize> {
+	let all_ssts = store.list_sst_ids().await?;
+	let mut deleted = 0;
+	for sst_id in all_ssts {
+		if !live_ssts.contains(&sst_id) && sst_age(&sst_id) > MIN_PURGE_AGE {
+			if let Err(e) = store.delete_sst(&sst_id).await {
+				log::warn!("Failed to purge orphaned SST {}: {}", sst_id, e);
+			} else {
+				deleted += 1;
+			}
+		}
+	}
+	if deleted > 0 {
+		log::info!("Purged {} orphaned SST files from object store (simple mode)", deleted);
+	}
+	Ok(deleted)
+}
+
 /// Delete SSTs from object store that are not referenced by any branch.
 ///
 /// Only deletes SSTs older than MIN_PURGE_AGE to avoid racing with

@@ -1,4 +1,3 @@
-#[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
@@ -64,18 +63,12 @@ impl Weighter<CacheKey, Item> for BlockWeighter {
 
 pub(crate) struct BlockCache {
 	data: QCache<CacheKey, Item, BlockWeighter>,
-	// Cache statistics (only enabled in tests)
-	#[cfg(test)]
+	// Cache statistics
 	data_hits: AtomicU64,
-	#[cfg(test)]
 	data_misses: AtomicU64,
-	#[cfg(test)]
 	index_hits: AtomicU64,
-	#[cfg(test)]
 	index_misses: AtomicU64,
-	#[cfg(test)]
 	data_history_hits: AtomicU64,
-	#[cfg(test)]
 	data_history_misses: AtomicU64,
 }
 
@@ -83,17 +76,11 @@ impl BlockCache {
 	pub(crate) fn with_capacity_bytes(bytes: u64) -> Self {
 		Self {
 			data: QCache::with_weighter(10_000, bytes, BlockWeighter),
-			#[cfg(test)]
 			data_hits: AtomicU64::new(0),
-			#[cfg(test)]
 			data_misses: AtomicU64::new(0),
-			#[cfg(test)]
 			index_hits: AtomicU64::new(0),
-			#[cfg(test)]
 			index_misses: AtomicU64::new(0),
-			#[cfg(test)]
 			data_history_hits: AtomicU64::new(0),
-			#[cfg(test)]
 			data_history_misses: AtomicU64::new(0),
 		}
 	}
@@ -146,13 +133,10 @@ impl BlockCache {
 		let key = (KIND_DATA, table_id, &offset);
 		let item = self.data.get(&key);
 
-		#[cfg(test)]
-		{
-			if item.is_some() {
-				self.data_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-			} else {
-				self.data_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-			}
+		if item.is_some() {
+			self.data_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		} else {
+			self.data_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 		}
 
 		match item.as_ref()? {
@@ -170,13 +154,10 @@ impl BlockCache {
 		let key = (KIND_DATA_HISTORY, table_id, &offset);
 		let item = self.data.get(&key);
 
-		#[cfg(test)]
-		{
-			if item.is_some() {
-				self.data_history_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-			} else {
-				self.data_history_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-			}
+		if item.is_some() {
+			self.data_history_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		} else {
+			self.data_history_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 		}
 
 		match item.as_ref()? {
@@ -190,13 +171,10 @@ impl BlockCache {
 		let key = (KIND_INDEX, table_id, &offset);
 		let item = self.data.get(&key);
 
-		#[cfg(test)]
-		{
-			if item.is_some() {
-				self.index_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-			} else {
-				self.index_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-			}
+		if item.is_some() {
+			self.index_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		} else {
+			self.index_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 		}
 
 		match item.as_ref()? {

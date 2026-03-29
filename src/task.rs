@@ -8,6 +8,8 @@ use crate::compaction::leveled::Strategy;
 use crate::compaction::CompactionStrategy;
 use crate::error::BackgroundErrorReason;
 use crate::lsm::CompactionOperations;
+use crate::metrics::DbStats;
+use crate::remote_compactor::CompactionMode;
 use crate::stall::WriteStallController;
 use crate::Options;
 
@@ -46,6 +48,8 @@ impl TaskManager {
 		core: Arc<dyn CompactionOperations>,
 		opts: Arc<Options>,
 		write_stall: Arc<WriteStallController>,
+		compaction_mode: CompactionMode,
+		db_stats: Arc<DbStats>,
 	) -> Self {
 		let stop_flag = Arc::new(AtomicBool::new(false));
 		let memtable_notify = Arc::new(Notify::new());
@@ -62,6 +66,7 @@ impl TaskManager {
 			let running = Arc::clone(&memtable_running);
 			let level_notify = Arc::clone(&level_notify);
 			let write_stall = Arc::clone(&write_stall);
+			let db_stats = Arc::clone(&db_stats);
 
 			let handle = tokio::spawn(async move {
 				loop {
@@ -81,6 +86,7 @@ impl TaskManager {
 						match core.compact_memtable().await {
 							Ok(true) => {
 								flush_count += 1;
+								DbStats::inc(&db_stats.memtable_flushes);
 								write_stall.signal_work_done();
 								// Check if there are more immutables to flush
 								if !core.has_pending_immutables() {
@@ -118,13 +124,15 @@ impl TaskManager {
 			task_handles.lock().unwrap().as_mut().unwrap().push(handle);
 		}
 
-		// Spawn level compaction task
-		{
+		// Spawn level compaction task only in InProcess mode.
+		// In Remote mode, an external RemoteCompactor handles L1+ compaction.
+		if matches!(compaction_mode, CompactionMode::InProcess) {
 			let core = Arc::clone(&core);
 			let stop_flag = Arc::clone(&stop_flag);
 			let notify = Arc::clone(&level_notify);
 			let running = Arc::clone(&level_running);
 			let write_stall = Arc::clone(&write_stall);
+			let db_stats = Arc::clone(&db_stats);
 
 			let handle = tokio::spawn(async move {
 				loop {
@@ -147,12 +155,15 @@ impl TaskManager {
 						write_stall.signal_shutdown();
 					} else {
 						log::debug!("Level compaction completed successfully");
+						DbStats::inc(&db_stats.compactions_completed);
 						write_stall.signal_work_done();
 					}
 					running.store(false, Ordering::SeqCst);
 				}
 			});
 			task_handles.lock().unwrap().as_mut().unwrap().push(handle);
+		} else {
+			log::info!("Level compaction task skipped (Remote compaction mode)");
 		}
 
 		Self {
@@ -218,6 +229,8 @@ mod tests {
 	use crate::compaction::CompactionStrategy;
 	use crate::error::{BackgroundErrorHandler, Result};
 	use crate::lsm::CompactionOperations;
+	use crate::metrics::DbStats;
+	use crate::remote_compactor::CompactionMode;
 	use crate::stall::{
 		StallCounts,
 		StallThresholds,
@@ -333,6 +346,8 @@ mod tests {
 			Arc::clone(&core) as Arc<dyn CompactionOperations>,
 			opts,
 			test_write_stall(),
+			CompactionMode::InProcess,
+			Arc::new(DbStats::new()),
 		);
 
 		task_manager.wake_up_memtable();
@@ -352,6 +367,8 @@ mod tests {
 			Arc::clone(&core) as Arc<dyn CompactionOperations>,
 			opts,
 			test_write_stall(),
+			CompactionMode::InProcess,
+			Arc::new(DbStats::new()),
 		);
 
 		for _ in 0..3 {
@@ -376,6 +393,8 @@ mod tests {
 			Arc::clone(&core) as Arc<dyn CompactionOperations>,
 			opts,
 			test_write_stall(),
+			CompactionMode::InProcess,
+			Arc::new(DbStats::new()),
 		);
 
 		task_manager.wake_up_level();
@@ -395,6 +414,8 @@ mod tests {
 			Arc::clone(&core) as Arc<dyn CompactionOperations>,
 			opts,
 			test_write_stall(),
+			CompactionMode::InProcess,
+			Arc::new(DbStats::new()),
 		);
 
 		for _ in 0..3 {
@@ -418,6 +439,8 @@ mod tests {
 			Arc::clone(&core) as Arc<dyn CompactionOperations>,
 			opts,
 			test_write_stall(),
+			CompactionMode::InProcess,
+			Arc::new(DbStats::new()),
 		);
 
 		// Wake up memtable and immediately try again while it's still running
@@ -460,6 +483,8 @@ mod tests {
 			Arc::clone(&core) as Arc<dyn CompactionOperations>,
 			opts,
 			test_write_stall(),
+			CompactionMode::InProcess,
+			Arc::new(DbStats::new()),
 		);
 
 		// Trigger memtable compaction that will fail
@@ -510,6 +535,8 @@ mod tests {
 			Arc::clone(&core) as Arc<dyn CompactionOperations>,
 			opts,
 			test_write_stall(),
+			CompactionMode::InProcess,
+			Arc::new(DbStats::new()),
 		);
 
 		// Make first memtable compaction fail
@@ -570,6 +597,8 @@ mod tests {
 			Arc::clone(&core) as Arc<dyn CompactionOperations>,
 			opts,
 			Arc::clone(&write_stall),
+			CompactionMode::InProcess,
+			Arc::new(DbStats::new()),
 		);
 
 		let stall_clone = Arc::clone(&write_stall);
@@ -605,6 +634,8 @@ mod tests {
 			Arc::clone(&core) as Arc<dyn CompactionOperations>,
 			opts,
 			Arc::clone(&write_stall),
+			CompactionMode::InProcess,
+			Arc::new(DbStats::new()),
 		);
 
 		let stall_clone = Arc::clone(&write_stall);
@@ -640,6 +671,8 @@ mod tests {
 			Arc::clone(&core) as Arc<dyn CompactionOperations>,
 			opts,
 			Arc::clone(&write_stall),
+			CompactionMode::InProcess,
+			Arc::new(DbStats::new()),
 		);
 
 		let mut writer_handles = Vec::new();

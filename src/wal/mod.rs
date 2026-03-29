@@ -552,21 +552,27 @@ impl WritableFile for BufferedFileWriter {
 // ===== Cleanup =====
 
 /// Cleans up old WAL segments based on the minimum log number with unflushed
-/// data.
+/// data, respecting an optional CDC watermark.
 ///
-/// This function removes all WAL segments with ID < min_wal_number, since they
-/// have been flushed to SSTables and are no longer needed. The manifest tracks
-/// which WALs have been flushed.
+/// This function removes all WAL segments with ID < effective_min, where
+/// effective_min is the lower of `min_wal_number` and `cdc_min_wal` (if set).
+/// This ensures CDC consumers can still read segments they haven't processed.
 ///
 /// # Arguments
 ///
 /// * `wal_dir` - The directory containing the WAL segments
 /// * `min_wal_number` - The minimum WAL number that contains unflushed data
+/// * `cdc_min_wal` - Optional CDC watermark; segments at or above this ID are retained for CDC
+///   consumers. `None` means no CDC retention.
 ///
 /// # Returns
 ///
 /// A result with the count of removed segments or an error
-pub(crate) fn cleanup_old_segments(wal_dir: &Path, min_wal_number: u64) -> Result<usize> {
+pub(crate) fn cleanup_old_segments(
+	wal_dir: &Path,
+	min_wal_number: u64,
+	cdc_min_wal: Option<u64>,
+) -> Result<usize> {
 	// Check if WAL directory exists
 	if !wal_dir.exists() {
 		return Ok(0);
@@ -583,18 +589,25 @@ pub(crate) fn cleanup_old_segments(wal_dir: &Path, min_wal_number: u64) -> Resul
 		return Ok(0);
 	}
 
+	// Respect CDC watermark: keep segments that CDC consumers still need
+	let effective_min = match cdc_min_wal {
+		Some(cdc) => min_wal_number.min(cdc),
+		None => min_wal_number,
+	};
+
 	let mut removed_count = 0;
 
-	// Remove all segments older than min_wal_number (already flushed to SST)
+	// Remove all segments older than effective_min (already flushed to SST
+	// and not needed by CDC consumers)
 	for segment_id in segment_ids {
-		if segment_id < min_wal_number {
+		if segment_id < effective_min {
 			let segment_path = wal_dir.join(format!("{segment_id:020}.wal"));
 
 			match fs::remove_file(&segment_path) {
 				Ok(_) => {
 					removed_count += 1;
 					log::debug!(
-						"Removed flushed WAL segment {segment_id:020} (older than min {min_wal_number:020})"
+						"Removed flushed WAL segment {segment_id:020} (older than effective min {effective_min:020})"
 					);
 				}
 				Err(e) => {

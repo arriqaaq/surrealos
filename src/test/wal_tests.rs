@@ -71,7 +71,7 @@ fn test_cleanup_old_segments() {
 	// Run cleanup - should remove all segments older than the latest one
 	// Set min_wal_number to the latest segment ID to keep only that segment
 	let latest_segment_id = *segment_ids_before.iter().max().unwrap();
-	let removed_count = cleanup_old_segments(temp_dir.path(), latest_segment_id).unwrap();
+	let removed_count = cleanup_old_segments(temp_dir.path(), latest_segment_id, None).unwrap();
 
 	// Verify at least 4 segments were removed (keeping only segments >=
 	// latest_segment_id)
@@ -486,7 +486,7 @@ fn test_cleanup_respects_min_wal_number() {
 
 	// Run cleanup with min_wal_number = 3
 	// This should delete segments 0, 1, 2 and keep 3, 4
-	let removed_count = cleanup_old_segments(temp_dir.path(), 3).unwrap();
+	let removed_count = cleanup_old_segments(temp_dir.path(), 3, None).unwrap();
 
 	assert_eq!(removed_count, 3, "Should remove segments 0, 1, 2");
 

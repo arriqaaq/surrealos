@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 use crate::error::{Error, Result, WriteStallReason};
+use crate::metrics::DbStats;
 
 /// Current counts of resources that can trigger write stalls.
 #[derive(Debug, Clone, Copy)]
@@ -68,6 +69,9 @@ pub struct WriteStallController {
 
 	/// Static thresholds configured at startup
 	thresholds: StallThresholds,
+
+	/// Optional metrics counters for recording write stall events.
+	db_stats: Option<Arc<DbStats>>,
 }
 
 impl WriteStallController {
@@ -78,7 +82,14 @@ impl WriteStallController {
 			shutdown: AtomicBool::new(false),
 			provider,
 			thresholds,
+			db_stats: None,
 		}
+	}
+
+	/// Sets the metrics counters for this controller.
+	pub fn with_db_stats(mut self, db_stats: Arc<DbStats>) -> Self {
+		self.db_stats = Some(db_stats);
+		self
 	}
 
 	/// Check stall conditions and wait if stalled. Called before each write.
@@ -154,6 +165,9 @@ impl WriteStallController {
 				stall_threshold = threshold;
 				stall_start = Some(Instant::now());
 				self.is_stalled.store(true, Ordering::Release);
+				if let Some(ref stats) = self.db_stats {
+					DbStats::inc(&stats.write_stalls);
+				}
 				log::warn!("Write stall: {:?} ({} >= {})", reason, value, threshold);
 			}
 

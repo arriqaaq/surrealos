@@ -118,6 +118,16 @@ pub(crate) struct CoreInner {
 
 	/// Fencing state for writer/compactor epoch tracking.
 	pub(crate) fencing: EpochManifest,
+
+	/// Shared metrics counters for observability.
+	pub(crate) db_stats: Arc<crate::metrics::DbStats>,
+
+	/// Background garbage collection task.
+	pub(crate) gc_task: Mutex<Option<crate::gc_task::GcTask>>,
+
+	/// CDC watermark: the minimum WAL segment ID that CDC consumers still need.
+	/// Initialized to u64::MAX (no CDC consumer, so no retention).
+	pub(crate) cdc_watermark: Arc<AtomicU64>,
 }
 
 impl CoreInner {
@@ -139,10 +149,30 @@ impl CoreInner {
 		} else {
 			None
 		};
-		let table_store = Arc::new(CloudStore::new(
-			Arc::clone(&opts.object_store),
+
+		// Wrap the object store with retry logic for transient error resilience.
+		// This is done once here so all CloudStore instances (table_store,
+		// branch recovery stores, etc.) benefit from automatic retries.
+		let object_store: Arc<dyn object_store::ObjectStore> =
+			Arc::new(crate::retrying_store::RetryingObjectStore::new(
+				Arc::clone(&opts.object_store),
+				opts.retry_config.clone(),
+			));
+
+		let db_stats = Arc::new(crate::metrics::DbStats::new());
+
+		// Construct the bounded disk cache if configured.
+		let disk_cache = opts
+			.disk_cache
+			.as_ref()
+			.map(|config| crate::disk_cache::DiskCache::new(config.clone()));
+
+		let table_store = Arc::new(CloudStore::with_stats_and_cache(
+			Arc::clone(&object_store),
 			StorePaths::new_with_branch(opts.object_store_root.as_str(), opts.branch_name.clone()),
 			local_sst_dir,
+			Arc::clone(&db_stats),
+			disk_cache,
 		));
 
 		let mut manifest = LevelManifest::new(Arc::clone(&opts), Arc::clone(&table_store)).await?;
@@ -161,7 +191,7 @@ impl CoreInner {
 
 			let root_path: object_store::path::Path = opts.object_store_root.as_str().into();
 			let mut registry =
-				crate::branch::load_registry(opts.object_store.as_ref(), &root_path).await?;
+				crate::branch::load_registry(object_store.as_ref(), &root_path).await?;
 			let mut changed = false;
 
 			let branches_snapshot: Vec<_> = registry
@@ -175,7 +205,7 @@ impl CoreInner {
 				let branch_resolver =
 					StorePaths::new_with_branch(root_path.clone(), Some(name.clone()));
 				let branch_store =
-					CloudStore::new(Arc::clone(&opts.object_store), branch_resolver, None);
+					CloudStore::new(Arc::clone(&object_store), branch_resolver, None);
 
 				if branch_store.read_latest_manifest().await?.is_some() {
 					// Manifest exists — creation completed, just status update missed
@@ -187,7 +217,7 @@ impl CoreInner {
 					let parent_resolver =
 						StorePaths::new_with_branch(root_path.clone(), info.parent_branch.clone());
 					let parent_store =
-						CloudStore::new(Arc::clone(&opts.object_store), parent_resolver, None);
+						CloudStore::new(Arc::clone(&object_store), parent_resolver, None);
 					if let Ok(bytes) = parent_store.read_manifest(info.source_manifest_id).await {
 						let reset_bytes = crate::manifest::reset_manifest_for_branch(&bytes)?;
 						branch_store.write_manifest(1, bytes::Bytes::from(reset_bytes)).await?;
@@ -211,8 +241,7 @@ impl CoreInner {
 			}
 
 			if changed {
-				crate::branch::save_registry(opts.object_store.as_ref(), &root_path, &registry)
-					.await?;
+				crate::branch::save_registry(object_store.as_ref(), &root_path, &registry).await?;
 			}
 		}
 
@@ -293,33 +322,22 @@ impl CoreInner {
 			});
 		}
 
-		// Spawn background SST purger when branching is enabled.
-		// Periodically scans all branch manifests and deletes orphaned SSTs
-		// from the shared object store pool.
-		if opts.branch_name.is_some() {
-			let purger_os = Arc::clone(&opts.object_store);
-			let purger_root = opts.object_store_root.clone();
-			tokio::spawn(async move {
-				let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
-				loop {
-					interval.tick().await;
-					let root_path: object_store::path::Path = purger_root.as_str().into();
-					match crate::branch::load_registry(purger_os.as_ref(), &root_path).await {
-						Ok(registry) => {
-							if let Err(e) =
-								crate::gc::purge_orphaned_ssts(&purger_os, &purger_root, &registry)
-									.await
-							{
-								log::warn!("Background SST purge failed: {e}");
-							}
-						}
-						Err(e) => {
-							log::warn!("Failed to load branch registry for purge: {e}");
-						}
-					}
-				}
-			});
-		}
+		// Spawn background GC task for manifest and SST cleanup.
+		// Replaces the previous ad-hoc purger that only ran when branching was enabled.
+		// Now runs in all modes: branch-aware GC when branching is on,
+		// simple manifest-based GC otherwise.
+		let gc_task = if opts.gc_config.enabled {
+			Some(crate::gc_task::GcTask::spawn(
+				opts.gc_config.clone(),
+				Arc::clone(&table_store),
+				Arc::clone(&level_manifest),
+				Arc::clone(&object_store),
+				opts.object_store_root.clone(),
+				opts.branch_name.is_some(),
+			))
+		} else {
+			None
+		};
 
 		let local_compactor_epoch = fencing.compactor_epoch();
 
@@ -337,6 +355,9 @@ impl CoreInner {
 			table_store,
 			manifest_uploader,
 			fencing,
+			db_stats,
+			gc_task: Mutex::new(gc_task),
+			cdc_watermark: Arc::new(AtomicU64::new(u64::MAX)),
 		})
 	}
 
@@ -484,6 +505,8 @@ impl CoreInner {
 		drop(active_memtable);
 		drop(immutable_memtables);
 
+		crate::metrics::DbStats::inc(&self.db_stats.memtable_rotations);
+
 		log::debug!(
 			"rotate_memtable: completed rotation, table_id={}, wal_number={}",
 			table_id,
@@ -540,9 +563,17 @@ impl CoreInner {
 		// Schedule async WAL cleanup
 		let wal_dir = self.wal.read().get_dir_path().to_path_buf();
 		let min_wal_to_keep = entry.wal_number + 1;
+		let cdc_min = {
+			let w = self.cdc_watermark.load(std::sync::atomic::Ordering::Acquire);
+			if w == u64::MAX {
+				None
+			} else {
+				Some(w)
+			}
+		};
 
 		tokio::spawn(async move {
-			match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
+			match cleanup_old_segments(&wal_dir, min_wal_to_keep, cdc_min) {
 				Ok(count) if count > 0 => {
 					log::info!(
 						"Cleaned up {} old WAL segments (min_wal_to_keep={})",
@@ -900,6 +931,7 @@ impl CoreInner {
 			manifest_uploader: Arc::clone(&self.manifest_uploader),
 			local_compactor_epoch: self.local_compactor_epoch,
 			branching_enabled: self.opts.branch_name.is_some(),
+			db_stats: Arc::clone(&self.db_stats),
 		}
 	}
 
@@ -1207,16 +1239,21 @@ impl Core {
 			memtable_limit: opts.memtable_stall_threshold,
 			l0_file_limit: opts.l0_stall_threshold,
 		};
-		let write_stall = Arc::new(WriteStallController::new(
-			Arc::clone(&inner) as Arc<dyn WriteStallCountProvider>,
-			thresholds,
-		));
+		let write_stall = Arc::new(
+			WriteStallController::new(
+				Arc::clone(&inner) as Arc<dyn WriteStallCountProvider>,
+				thresholds,
+			)
+			.with_db_stats(Arc::clone(&inner.db_stats)),
+		);
 
 		// Initialize background task manager
 		let task_manager = Arc::new(TaskManager::new(
 			Arc::clone(&inner) as Arc<dyn CompactionOperations>,
 			Arc::clone(&opts),
 			Arc::clone(&write_stall),
+			opts.compaction_mode.clone(),
+			Arc::clone(&inner.db_stats),
 		));
 
 		let commit_env =
@@ -1329,7 +1366,9 @@ impl Core {
 
 	pub(crate) async fn commit(&self, batch: Batch, sync: bool) -> Result<()> {
 		// Commit the batch using the commit pipeline
-		self.commit_pipeline.commit(batch, sync).await
+		self.commit_pipeline.commit(batch, sync).await?;
+		crate::metrics::DbStats::inc(&self.inner.db_stats.commits);
+		Ok(())
 	}
 
 	/// Flushes WAL buffers to OS cache.
@@ -1381,6 +1420,16 @@ impl Core {
 			log::debug!("Background task manager stopped");
 		}
 
+		// Step 3.5: Stop background GC task
+		{
+			let mut gc_task = self.inner.gc_task.lock().unwrap().take();
+			if let Some(ref mut task) = gc_task {
+				log::debug!("Stopping background GC task...");
+				task.stop().await;
+				log::debug!("Background GC task stopped");
+			}
+		}
+
 		// Step 2: Conditionally flush ALL memtables based on flush_on_close option
 		// CRITICAL ORDERING: Immutable memtables must be flushed BEFORE active memtable
 		// to preserve SSTable ordering (older data = lower table_ids)
@@ -1415,10 +1464,18 @@ impl Core {
 		// the active WAL if done before closing it.
 		let wal_dir = self.inner.wal.read().get_dir_path().to_path_buf();
 		let min_wal_to_keep = self.inner.level_manifest.read()?.get_log_number();
+		let cdc_min = {
+			let w = self.inner.cdc_watermark.load(std::sync::atomic::Ordering::Acquire);
+			if w == u64::MAX {
+				None
+			} else {
+				Some(w)
+			}
+		};
 
 		log::debug!("Cleaning up obsolete WAL files (min_wal_to_keep={})", min_wal_to_keep);
 
-		match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
+		match cleanup_old_segments(&wal_dir, min_wal_to_keep, cdc_min) {
 			Ok(count) if count > 0 => {
 				log::info!("Cleaned up {} obsolete WAL files during shutdown", count);
 			}
@@ -1669,6 +1726,40 @@ impl Store {
 
 	pub async fn close(&self) -> Result<()> {
 		self.core.close().await
+	}
+
+	/// Returns the shared metrics counters for this store.
+	pub fn stats(&self) -> Arc<crate::metrics::DbStats> {
+		Arc::clone(&self.core.inner.db_stats)
+	}
+
+	/// Applies a merge operand to the given key.
+	pub async fn merge(
+		&self,
+		key: impl crate::IntoBytes,
+		operand: impl crate::IntoBytes,
+	) -> Result<()> {
+		let mut batch = self.new_batch();
+		batch.merge(key.as_slice(), operand.as_slice())?;
+		self.apply(batch, true).await
+	}
+
+	/// Creates a WAL reader starting from the given position.
+	pub fn wal_reader(
+		&self,
+		from: crate::wal_reader::WalPosition,
+	) -> Result<crate::wal_reader::WalReader> {
+		crate::wal_reader::WalReader::new(self.core.inner.opts.wal_dir(), from)
+	}
+
+	/// Creates a WAL reader starting from the earliest available segment.
+	pub fn wal_reader_from_earliest(&self) -> Result<crate::wal_reader::WalReader> {
+		crate::wal_reader::WalReader::from_earliest(self.core.inner.opts.wal_dir())
+	}
+
+	/// Sets the CDC watermark — WAL segments at or above this ID will not be cleaned up.
+	pub fn set_cdc_watermark(&self, segment_id: u64) {
+		self.core.inner.cdc_watermark.store(segment_id, std::sync::atomic::Ordering::Release);
 	}
 
 	/// Flushes all memtables to disk synchronously.

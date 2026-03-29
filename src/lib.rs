@@ -7,22 +7,29 @@ mod commit;
 mod compaction;
 mod comparator;
 mod compression;
+mod disk_cache;
 mod epoch;
 mod error;
 mod gc;
+mod gc_task;
 mod iter;
 mod levels;
 mod lockfile;
 mod lsm;
 mod manifest;
 mod memtable;
+pub mod merge_operator;
+pub mod metrics;
 mod paths;
+pub mod remote_compactor;
+mod retrying_store;
 mod snapshot;
 mod sstable;
 pub(crate) mod stall;
 pub(crate) mod task;
 mod vfs;
 mod wal;
+pub mod wal_reader;
 
 #[cfg(test)]
 mod test;
@@ -38,9 +45,16 @@ use sstable::bloom::LevelDBBloomFilter;
 
 pub use crate::batch::Batch;
 use crate::clock::{DefaultLogicalClock, LogicalClock};
+pub use crate::disk_cache::DiskCacheConfig;
 pub use crate::error::{Error, Result};
+pub use crate::gc_task::GcConfig;
 pub use crate::lsm::{Store, StoreBuilder};
+pub use crate::merge_operator::MergeOperator;
+pub use crate::metrics::{DbStats, StatsSnapshot};
+pub use crate::remote_compactor::{CompactionMode, CompactorConfig, RemoteCompactor};
+pub use crate::retrying_store::RetryConfig;
 pub use crate::snapshot::{HistoryIterator, Snapshot, SnapshotIterator};
+pub use crate::wal_reader::{WalEntry, WalPosition, WalReader};
 // Alias for backward compatibility
 pub type Tree = Store;
 pub type TreeBuilder = StoreBuilder;
@@ -233,6 +247,38 @@ pub struct Options {
 	/// SSTs remain in the shared pool (ULIDs are globally unique).
 	/// Default: None (root/main branch)
 	pub branch_name: Option<String>,
+
+	// Retry configuration
+	/// Retry configuration for object store operations.
+	/// Controls exponential backoff parameters for transient error retries.
+	/// Default: RetryConfig::default() (100ms min, 1s max, factor 2, jitter on)
+	pub retry_config: RetryConfig,
+
+	// Disk cache configuration
+	/// Optional bounded disk cache for SST files.
+	/// When set, SST reads check the local disk cache before the object store.
+	/// The cache is LRU-evicted to stay within the configured size limit.
+	/// Default: None (no disk cache)
+	pub disk_cache: Option<DiskCacheConfig>,
+
+	// Garbage collection configuration
+	/// Controls background garbage collection for manifests and orphaned SSTs.
+	/// Default: GcConfig::default() (enabled, 600s interval, keep 10 manifests, 1h SST age)
+	pub gc_config: GcConfig,
+
+	// Compaction mode
+	/// Controls whether level compaction runs in-process or is handled by an
+	/// external `RemoteCompactor` process.
+	/// In `Remote` mode, the writer only flushes memtables to L0; an external
+	/// compactor handles L1+ compaction via the object store.
+	/// Default: InProcess
+	pub compaction_mode: CompactionMode,
+
+	/// User-defined merge operator for associative read-modify-write operations.
+	/// When set, `Merge` entries in the write path are combined with existing
+	/// values during reads and compaction using the provided operator.
+	/// Default: None
+	pub merge_operator: Option<Arc<dyn MergeOperator>>,
 }
 
 impl Default for Options {
@@ -274,6 +320,11 @@ impl Default for Options {
 			manifest_update_timeout: Duration::from_secs(30),
 			local_sst_cache: true,
 			branch_name: None,
+			retry_config: RetryConfig::default(),
+			disk_cache: None,
+			gc_config: GcConfig::default(),
+			compaction_mode: CompactionMode::default(),
+			merge_operator: None,
 		}
 	}
 }
@@ -471,6 +522,40 @@ impl Options {
 	/// When set, manifests are stored under a branch-scoped prefix.
 	pub fn with_branch(mut self, name: impl Into<String>) -> Self {
 		self.branch_name = Some(name.into());
+		self
+	}
+
+	/// Sets the retry configuration for object store operations.
+	pub fn with_retry_config(mut self, config: RetryConfig) -> Self {
+		self.retry_config = config;
+		self
+	}
+
+	/// Sets the garbage collection configuration.
+	pub fn with_gc_config(mut self, config: GcConfig) -> Self {
+		self.gc_config = config;
+		self
+	}
+
+	/// Enables the bounded local disk cache for SST files.
+	/// When set, SST reads check the local disk cache before the object store.
+	/// The cache is LRU-evicted to stay within the configured size limit.
+	pub fn with_disk_cache(mut self, config: DiskCacheConfig) -> Self {
+		self.disk_cache = Some(config);
+		self
+	}
+
+	/// Sets the compaction mode.
+	/// In `Remote` mode, the writer only flushes memtables to L0; level compaction
+	/// is handled by an external `RemoteCompactor` process.
+	pub fn with_compaction_mode(mut self, mode: CompactionMode) -> Self {
+		self.compaction_mode = mode;
+		self
+	}
+
+	/// Sets the merge operator for associative read-modify-write operations.
+	pub fn with_merge_operator(mut self, op: Arc<dyn MergeOperator>) -> Self {
+		self.merge_operator = Some(op);
 		self
 	}
 

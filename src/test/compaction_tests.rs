@@ -207,6 +207,7 @@ fn create_compaction_options(
 		manifest_uploader: Arc::new(ManifestUploader::new(tx)),
 		local_compactor_epoch: 0,
 		branching_enabled: false,
+		db_stats: Arc::new(crate::metrics::DbStats::new()),
 	}
 }
 
@@ -1921,6 +1922,7 @@ async fn test_tombstone_propagation_journey() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![],
+		None,
 	);
 	let mut non_bottom_result = Vec::new();
 	while let Some(entry) = comp_iter_non_bottom.advance().await.unwrap() {
@@ -1946,6 +1948,7 @@ async fn test_tombstone_propagation_journey() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![],
+		None,
 	);
 	let mut bottom_result = Vec::new();
 	while let Some(entry) = comp_iter_bottom.advance().await.unwrap() {

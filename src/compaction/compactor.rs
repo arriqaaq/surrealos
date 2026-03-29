@@ -9,6 +9,7 @@ use crate::iter::{BoxedLSMIterator, CompactionIterator};
 use crate::levels::LevelManifest;
 use crate::manifest::{write_manifest_to_disk, ManifestChangeSet, ManifestUploader};
 use crate::memtable::ImmutableMemtables;
+use crate::metrics::DbStats;
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::{Table, TableWriter};
 use crate::sstable::SstId;
@@ -67,6 +68,8 @@ pub(crate) struct CompactionOptions {
 	/// When true, SST deletion from object store is deferred to the
 	/// background purger. Only local cache copies are removed.
 	pub(crate) branching_enabled: bool,
+	/// Shared metrics counters for recording compaction bytes.
+	pub(crate) db_stats: Arc<DbStats>,
 }
 
 // ============================================================================
@@ -266,9 +269,15 @@ impl Compactor {
 		};
 
 		// Update manifest - this will commit the guard on success
-		update_manifest(&self.options, input, new_table, &mut guard)?;
+		update_manifest(&self.options, input, new_table.clone(), &mut guard)?;
 
 		cleanup_old_tables(&self.options.table_store, input, self.options.branching_enabled).await;
+
+		// Record compaction bytes metrics
+		let bytes_read: u64 = to_merge.iter().map(|t| t.file_size).sum();
+		let bytes_written: u64 = new_table.as_ref().map(|t| t.file_size).unwrap_or(0);
+		DbStats::add(&self.options.db_stats.compaction_bytes_read, bytes_read);
+		DbStats::add(&self.options.db_stats.compaction_bytes_written, bytes_written);
 
 		Ok(())
 	}
@@ -299,6 +308,7 @@ impl Compactor {
 			self.options.lopts.versioned_history_retention_ns,
 			Arc::clone(&self.options.lopts.clock),
 			snapshots,
+			self.options.lopts.merge_operator.clone(),
 		);
 
 		let mut entries = 0;

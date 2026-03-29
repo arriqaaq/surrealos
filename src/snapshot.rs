@@ -9,6 +9,7 @@ use crate::iter::BoxedLSMIterator;
 use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
+use crate::merge_operator::MergeOperator;
 use crate::sstable::table::Table;
 use crate::{
 	BytewiseComparator,
@@ -209,30 +210,123 @@ impl Snapshot {
 	/// 2. **Immutable Memtables**: Recent writes being flushed
 	/// 3. **Level**: From SSTables
 	///
-	/// The search stops at the first version found with seq_num <= snapshot
-	/// seq_num.
+	/// The search stops at the first Set/Delete version found with
+	/// seq_num <= snapshot seq_num. When Merge entries are encountered,
+	/// scanning continues to collect all Merge operands until a Set,
+	/// Delete, or end of data is reached, then the merge operator is
+	/// applied.
 	pub(crate) async fn get(&self, key: &[u8]) -> crate::Result<Option<(Value, u64)>> {
-		// Check the active memtable for the key
+		crate::metrics::DbStats::inc(&self.core.inner.db_stats.point_lookups);
+		// Batch size for partial_merge to avoid unbounded memory.
+		const MERGE_BATCH_SIZE: usize = 100;
+
+		/// Result of checking a single source for a key.
+		enum LookupResult {
+			/// Found a Set entry — return or use as merge base.
+			Set(Value, u64),
+			/// Found a Delete entry — key is deleted.
+			Deleted(u64),
+			/// Found a Merge entry — collect operand and keep searching.
+			Merge(Value, u64),
+		}
+
+		// Collect merge operands (oldest-to-newest; we'll reverse at the end
+		// since we scan newest-first).
+		let mut merge_operands: Vec<Value> = Vec::new();
+		let mut merge_seq: Option<u64> = None;
+		let merge_op: Option<&dyn MergeOperator> = self.core.opts.merge_operator.as_deref();
+
+		/// Helper: apply batched partial_merge to keep operand list bounded.
+		fn batch_partial_merge(
+			merge_op: &dyn MergeOperator,
+			key: &[u8],
+			operands: &mut Vec<Value>,
+		) -> crate::Result<()> {
+			if operands.len() >= MERGE_BATCH_SIZE {
+				// operands are in newest-first order at this point; reverse
+				// for the merge call (oldest-first).
+				operands.reverse();
+				let refs: Vec<&[u8]> = operands.iter().map(|v| v.as_slice()).collect();
+				let merged = merge_op.partial_merge(key, &refs)?;
+				operands.clear();
+				operands.push(merged);
+			}
+			Ok(())
+		}
+
+		// ----- Helper closure to process a lookup result -----
+		// Returns: Some(final_answer) when search should stop,
+		//          None when search should continue.
+		macro_rules! handle_result {
+			($result:expr, $key:expr) => {
+				match $result {
+					LookupResult::Set(value, seq) => {
+						if merge_operands.is_empty() {
+							return Ok(Some((value, seq)));
+						}
+						// We have accumulated merge operands; apply full_merge.
+						let op = merge_op.ok_or(Error::MergeOperatorRequired)?;
+						// Operands are in newest-first order; reverse to oldest-first.
+						merge_operands.reverse();
+						let refs: Vec<&[u8]> =
+							merge_operands.iter().map(|v| v.as_slice()).collect();
+						let merged = op.full_merge($key, &value, &refs)?;
+						return Ok(Some((merged, merge_seq.unwrap_or(seq))));
+					}
+					LookupResult::Deleted(seq) => {
+						if merge_operands.is_empty() {
+							return Ok(None);
+						}
+						// Treat Delete as "no base" — use partial_merge.
+						let op = merge_op.ok_or(Error::MergeOperatorRequired)?;
+						merge_operands.reverse();
+						let refs: Vec<&[u8]> =
+							merge_operands.iter().map(|v| v.as_slice()).collect();
+						let merged = op.partial_merge($key, &refs)?;
+						return Ok(Some((merged, merge_seq.unwrap_or(seq))));
+					}
+					LookupResult::Merge(operand, seq) => {
+						let _op = merge_op.ok_or(Error::MergeOperatorRequired)?;
+						if merge_seq.is_none() {
+							merge_seq = Some(seq);
+						}
+						merge_operands.push(operand);
+						// Batch partial merge to bound memory.
+						batch_partial_merge(_op, $key, &mut merge_operands)?;
+					}
+				}
+			};
+		}
+
+		// ===== Search active memtable =====
 		{
 			let memtable_lock = self.core.active_memtable.read()?;
 			if let Some(item) = memtable_lock.get(key.as_ref(), Some(self.seq_num)) {
-				if item.0.is_tombstone() {
-					return Ok(None);
-				}
-				return Ok(Some((item.1, item.0.seq_num())));
+				let result = match item.0.kind() {
+					InternalKeyKind::Delete | InternalKeyKind::RangeDelete => {
+						LookupResult::Deleted(item.0.seq_num())
+					}
+					InternalKeyKind::Merge => LookupResult::Merge(item.1, item.0.seq_num()),
+					_ => LookupResult::Set(item.1, item.0.seq_num()),
+				};
+				handle_result!(result, key);
 			}
 		}
 
-		// Check the immutable memtables for the key
+		// ===== Search immutable memtables =====
 		{
 			let memtable_lock = self.core.immutable_memtables.read()?;
 			for entry in memtable_lock.iter().rev() {
 				let memtable = &entry.memtable;
 				if let Some(item) = memtable.get(key.as_ref(), Some(self.seq_num)) {
-					if item.0.is_tombstone() {
-						return Ok(None);
-					}
-					return Ok(Some((item.1, item.0.seq_num())));
+					let result = match item.0.kind() {
+						InternalKeyKind::Delete | InternalKeyKind::RangeDelete => {
+							LookupResult::Deleted(item.0.seq_num())
+						}
+						InternalKeyKind::Merge => LookupResult::Merge(item.1, item.0.seq_num()),
+						_ => LookupResult::Set(item.1, item.0.seq_num()),
+					};
+					handle_result!(result, key);
 				}
 			}
 		}
@@ -266,17 +360,30 @@ impl Snapshot {
 			candidates
 		}; // level_manifest lock dropped here
 
-		// Now do async lookups without holding the lock
+		// ===== Search SSTables =====
 		for (_level_idx, table) in &candidate_tables {
 			let maybe_item = table.get(&ikey).await?;
 
 			if let Some(item) = maybe_item {
-				let ikey = &item.0;
-				if ikey.is_tombstone() {
-					return Ok(None);
-				}
-				return Ok(Some((item.1, ikey.seq_num())));
+				let result = match item.0.kind() {
+					InternalKeyKind::Delete | InternalKeyKind::RangeDelete => {
+						LookupResult::Deleted(item.0.seq_num())
+					}
+					InternalKeyKind::Merge => LookupResult::Merge(item.1, item.0.seq_num()),
+					_ => LookupResult::Set(item.1, item.0.seq_num()),
+				};
+				handle_result!(result, key);
 			}
+		}
+
+		// ===== End of all sources =====
+		// If we have accumulated merge operands but no base value, use partial_merge.
+		if !merge_operands.is_empty() {
+			let op = merge_op.ok_or(Error::MergeOperatorRequired)?;
+			merge_operands.reverse();
+			let refs: Vec<&[u8]> = merge_operands.iter().map(|v| v.as_slice()).collect();
+			let merged = op.partial_merge(key, &refs)?;
+			return Ok(Some((merged, merge_seq.unwrap_or(0))));
 		}
 
 		Ok(None)

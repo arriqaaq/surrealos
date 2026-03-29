@@ -2242,9 +2242,6 @@ async fn test_manifest_checkpoint_recovery_cycles() {
 }
 
 /// Verifies that `filter_handle` (offset + size) survives `Levels::encode()/decode()`.
-///
-/// Analogous to SlateDB's `test_should_encode_decode_ssts_with_visible_ranges` —
-/// directly validates the new V1 binary format for the filter_handle field.
 #[tokio::test]
 async fn test_levels_filter_handle_roundtrip() {
 	use std::io::Cursor;
@@ -2299,10 +2296,6 @@ async fn test_levels_filter_handle_roundtrip() {
 }
 
 /// Full manifest write → reload → `Table::get()` with bloom filter active.
-///
-/// Analogous to SlateDB's `test_put_get_reopen_delete_with_separate_wal_store`.
-/// Verifies that `filter_handle` is preserved across the manifest round-trip and
-/// that the filter correctly functions after reload (both hit and miss paths).
 #[tokio::test]
 async fn test_manifest_reload_filter_works() {
 	use std::collections::HashSet;
